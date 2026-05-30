@@ -106,6 +106,7 @@ from src.utils import media_pool_changes as _media_pool_changes
 from src.utils import timeline_versioning as _timeline_versioning
 from src.utils import destructive_hook as _destructive_hook
 from src.utils.destructive_hook import destructive_op as _destructive_op
+from src.granular import media_pool_item as _granular_media_pool_item
 
 paths = get_resolve_paths()
 RESOLVE_API_PATH = paths["api_path"]
@@ -13260,6 +13261,38 @@ def media_pool_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
     elif action == "clear_mark_in_out":
         return {"success": bool(clip.ClearMarkInOut(p.get("type", "all")))}
     return _unknown(action, ["get_name","get_metadata","set_metadata","get_third_party_metadata","set_third_party_metadata","get_media_id","get_clip_property","set_clip_property","get_clip_color","set_clip_color","clear_clip_color","link_proxy","unlink_proxy","replace_clip","set_name","link_full_resolution_media","monitor_growing_file","replace_clip_preserve_sub_clip","get_unique_id","transcribe_audio","clear_transcription","get_audio_mapping","get_mark_in_out","set_mark_in_out","clear_mark_in_out","open_in_viewer"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOOL 13b: clip_transcript
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def clip_transcript(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Read and manage DaVinci Resolve audio transcriptions for media pool clips.
+
+    Actions:
+      list() -> {clips}
+        All transcribed clips in the media pool.
+      get(clip_id, with_timecodes=False, wait_seconds=30)
+          -> {name, status, text, source, truncated, [lines]}
+        Full transcript for one clip. `text` is sourced from the clip property,
+        but if Resolve truncated it (long transcripts end with an ellipsis) the
+        full text is read from the subtitle track. `source` is "property" or
+        "subtitles"; `truncated` flags an incomplete property preview.
+        with_timecodes=True also returns caption-chunk `lines` with frame-accurate
+        timecodes (timeline-scoped; may generate a subtitle track on the current timeline).
+      get_all(with_timecodes=False, wait_seconds=30) -> {clips}
+        Same as get for every transcribed clip.
+      transcribe(clip_ids | scope=mediapool|timeline|folder, skip_existing=True)
+          -> {started, skipped, failed}
+        Starts transcription (asynchronous). Poll with status.
+      status(clip_ids | scope) -> {clips}
+        Per-clip transcription status, for polling completion.
+
+    Read-first: prefer get/list over media_pool_item metadata, which Resolve truncates.
+    """
+    return _granular_media_pool_item.clip_transcript(action, params)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
