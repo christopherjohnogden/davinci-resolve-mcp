@@ -353,6 +353,19 @@ class TranscriptTruncationFallbackTests(unittest.TestCase):
         self.assertEqual(res["text"], "Partial…")
         self.assertIn("note", res)
 
+    def test_truncated_with_timecodes_returns_full_text_and_lines(self):
+        clip = FakeClip("c1", "Clip1", status="Transcribed", text="Hello…")
+        tl = FakeTimeline(subtitle_items=[
+            FakeSubtitleItem("Hello world, the full thing.", 0, 24),
+        ], fps="24")
+        res = mpi._build_transcript_payload(
+            FakeProject(tl), clip, with_timecodes=True, wait_seconds=1)
+        self.assertEqual(res["source"], "subtitles")
+        self.assertTrue(res["truncated"])
+        self.assertEqual(res["text"], "Hello world, the full thing.")
+        self.assertIn("lines", res)
+        self.assertEqual(len(res["lines"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

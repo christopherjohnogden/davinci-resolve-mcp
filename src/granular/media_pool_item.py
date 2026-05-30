@@ -1003,13 +1003,10 @@ def _build_transcript_payload(project, clip, *, with_timecodes: bool, wait_secon
         for key in ("granularity", "subtitle_track_created"):
             if key in tc:
                 payload[key] = tc[key]
-        # If tc only has a "note" (e.g. no timeline), propagate it (may override
-        # the truncation note set above, but with_timecodes note is more specific).
-        if "note" in tc and not note:
-            payload["note"] = tc["note"]
-        elif "note" in tc and note:
-            # Both truncation and timecode have notes — timecode note wins since
-            # it directly answers the with_timecodes request.
+        if "note" in tc:
+            # tc note wins over any truncation note: it directly answers the
+            # with_timecodes request and, when no timeline exists, explains why both
+            # the full text and the timecodes are unavailable.
             payload["note"] = tc["note"]
     return payload
 
