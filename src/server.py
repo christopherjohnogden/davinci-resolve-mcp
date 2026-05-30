@@ -288,7 +288,7 @@ High-value workflows:
 - Media ingest: use media_pool.ingest_capabilities, safe_import_media/safe_import_sequence, organize_clips, normalize_metadata, and relink planning actions.
 - Color: use timeline_item_color.grade_boundary_report, probe_node_graph, safe_set_cdl, safe_apply_drx, grade_version_snapshot/restore, and gallery/color-group capability actions.
 - Fusion: use fusion_comp.fusion_boundary_report, probe_fusion_comp, safe_add_tool, safe_set_inputs, and safe_connect_tools.
-- Audio/Fairlight: use timeline.fairlight_boundary_report, probe_audio_track/item, voice_isolation_capabilities, safe_auto_sync_audio, and subtitle_generation_probe.
+- Audio/Fairlight: use timeline.fairlight_boundary_report, probe_audio_track/item, voice_isolation_capabilities, safe_auto_sync_audio, and subtitle_generation_probe. For safe_auto_sync_audio, trust the returned `linked` list (clips that actually got synced audio), not `success` — a sync can return success:true yet link nothing when no waveform matches. Sync one video against candidate lavs and read back which lav is in `linked`; omit `settings` for the reliable default.
 - Render/deliver: use render.export_render_boundary_report, validate_render_settings, safe_set_render_settings, prepare_render_job, and safe_quick_export.
 - Project lifecycle: use project_manager.project_boundary_report and safe project/database/archive actions. Keep destructive work scoped to disposable _mcp_ projects unless the user explicitly approves otherwise.
 - Extension authoring: use script_plugin.extension_boundary_report and safe_install_extension/safe_remove_extension. Respect refresh/restart requirements.
@@ -5068,7 +5068,7 @@ def _audio_capabilities():
             "voice_isolation": "Track/item voice isolation depends on Resolve version, license, page state, and audio content.",
             "transcription_subtitles": "Transcription and subtitle generation can be asynchronous and may require installed AI components.",
             "audio_property_writes": "Some item types expose audio properties as read-only or reject writes despite returning readable values.",
-            "auto_sync": "AutoSyncAudio depends on media content, channel layout, and selected sync settings.",
+            "auto_sync": "AutoSyncAudio depends on media content and channel layout; a call can return success:true while matching nothing. Verify via the safe_auto_sync_audio `linked` list (clips that actually got synced audio) rather than the success flag. Omit settings for the reliable waveform+replace default.",
         },
         "unsupported": {
             "destructive_audio_media_processing": "The kernel does not transcode, render, proxy, or alter source audio files.",
@@ -14443,7 +14443,16 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
       audio_mix_capability_report(...) -> {capabilities, mix_recommendations}
       voice_isolation_capabilities(track_index?, track_type?, item_index?) -> {timeline_track, item}
       audio_mapping_report(clip_ids?) -> {timeline_items, media_pool_items}
-      safe_auto_sync_audio(clip_ids|selected, settings?, dry_run?) -> {success}
+      safe_auto_sync_audio(clip_ids|selected, settings?, dry_run?)
+          -> {success, linked, linked_count, newly_linked, newly_linked_count, already_linked}
+        TRUST `linked`, NOT `success`. `success` only means the AutoSyncAudio call
+        ran; a clip can return success:true while linking nothing (no waveform
+        match). `linked` lists every clip that actually has synced audio now
+        ({clip, synced_audio}); `newly_linked` is what changed this call. Report a
+        clip as synced ONLY if it appears in `linked`. To match one video against
+        several candidate lavs, pass [video_id, lav1_id, lav2_id, ...] and read
+        back which lav appears in `linked`. Omit `settings` for the reliable
+        waveform+replace default; an empty/normalized settings dict is fine.
       transcription_capabilities(clip_ids?|selected?) -> {clip_methods, folder}
       subtitle_generation_probe(settings?, allow_generate?) -> {success}
       fairlight_boundary_report(...) -> {capabilities, track, item, audio_mapping, transcription}
