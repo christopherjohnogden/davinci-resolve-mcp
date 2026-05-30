@@ -5298,17 +5298,26 @@ def _safe_auto_sync_audio(mp, p: Dict[str, Any]):
         ok = bool(mp.AutoSyncAudio(clips))
 
     # Verify by reading back the Synced Audio property — AutoSyncAudio's boolean
-    # is not sufficient proof. Report which clips are now linked and to what, so
-    # a caller never has to trust an unverified "success".
-    linked = []
+    # is not sufficient proof. Report the CURRENT linkage of every clip, and
+    # distinguish "newly linked this call" from "already linked": re-syncing an
+    # already-synced clip leaves the property unchanged, which must NOT be read
+    # as a failure. `linked` = every clip currently carrying synced audio.
+    linked = []          # every clip that currently has synced audio (the truth)
+    newly_linked = []    # clips whose synced audio changed as a result of THIS call
     for c in clips:
         after = _synced_audio(c)
-        if after and after != before.get(c.GetUniqueId(), ""):
-            linked.append({"clip": c.GetName(), "synced_audio": after})
+        if after:
+            entry = {"clip": c.GetName(), "synced_audio": after}
+            linked.append(entry)
+            if after != before.get(c.GetUniqueId(), ""):
+                newly_linked.append(entry)
     return {
         "success": ok,
-        "linked": linked,                 # clips whose Synced Audio changed this call
-        "newly_linked_count": len(linked),
+        "linked": linked,                       # current state — what is synced now
+        "linked_count": len(linked),
+        "newly_linked": newly_linked,           # what changed on this call
+        "newly_linked_count": len(newly_linked),
+        "already_linked": len(linked) - len(newly_linked),
         "count": len(clips),
         "missing": missing,
         "settings": settings,
