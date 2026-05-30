@@ -832,6 +832,205 @@ def clear_clip_transcription(clip_id: str) -> Dict[str, Any]:
     return {"success": bool(result)}
 
 
+def _transcription_status(clip) -> str:
+    """Best-effort transcription status string ('' if unavailable)."""
+    try:
+        return clip.GetClipProperty("Transcription Status") or ""
+    except Exception:
+        return ""
+
+
+def _transcription_text(clip) -> str:
+    """Best-effort transcript text ('' if unavailable)."""
+    try:
+        return clip.GetClipProperty("Transcription") or ""
+    except Exception:
+        return ""
+
+
+def _frames_to_tc(frame, fps) -> str:
+    """Format a timeline frame number as HH:MM:SS:FF using fps (rounded)."""
+    try:
+        f = int(round(float(frame)))
+        rate = int(round(float(fps))) or 24
+    except Exception:
+        return ""
+    s, ff = divmod(f, rate)
+    return "%02d:%02d:%02d:%02d" % (s // 3600, (s // 60) % 60, s % 60, ff)
+
+
+def _transcript_timecode_lines(project, clip, *, wait_seconds: int = 30) -> Dict[str, Any]:
+    """Assemble caption-chunk transcript lines (text + frame-accurate TC).
+
+    Timecodes are timeline-scoped: they come from the current timeline's subtitle
+    track, which only covers clips actually on that timeline. Returns a dict with
+    either {"lines": [...], "subtitle_track_created": bool, "granularity": ...}
+    or {"note": "..."} when timecodes are unavailable. Never raises.
+    """
+    try:
+        tl = project.GetCurrentTimeline() if project else None
+    except Exception:
+        tl = None
+    if not tl:
+        return {"note": "No current timeline; timecodes require the clip to be on an open timeline."}
+
+    fps = tl.GetSetting("timelineFrameRate")
+
+    def read_lines():
+        out = []
+        try:
+            count = tl.GetTrackCount("subtitle")
+        except Exception:
+            count = 0
+        for idx in range(1, (count or 0) + 1):
+            for item in (tl.GetItemListInTrack("subtitle", idx) or []):
+                try:
+                    out.append({
+                        "text": item.GetName(),
+                        "start_tc": _frames_to_tc(item.GetStart(), fps),
+                        "end_tc": _frames_to_tc(item.GetEnd(), fps),
+                        "start_frame": item.GetStart(),
+                    })
+                except Exception:
+                    continue
+        return out
+
+    # If captions already exist, read them without mutating anything.
+    existing = read_lines()
+    created = False
+    if not existing:
+        try:
+            before = tl.GetTrackCount("subtitle")
+        except Exception:
+            before = 0
+        try:
+            ok = tl.CreateSubtitlesFromAudio({})
+        except Exception as exc:
+            return {"note": f"Could not generate captions for timecodes: {exc}"}
+        if not ok:
+            return {"note": "CreateSubtitlesFromAudio returned failure; timecodes unavailable."}
+        # CreateSubtitlesFromAudio is async — poll until items populate.
+        deadline = max(1, int(wait_seconds))
+        lines = []
+        for _ in range(deadline * 2):  # poll twice/second
+            lines = read_lines()
+            if lines:
+                break
+            time.sleep(0.5)
+        try:
+            after = tl.GetTrackCount("subtitle")
+            created = after > before
+        except Exception:
+            created = True
+        if not lines:
+            return {
+                "note": "Timecode generation pending; try again.",
+                "subtitle_track_created": created,
+            }
+        return {
+            "lines": lines,
+            "granularity": "caption-chunk",
+            "subtitle_track_created": created,
+        }
+
+    return {
+        "lines": existing,
+        "granularity": "caption-chunk",
+        "subtitle_track_created": False,
+    }
+
+
+def _build_transcript_payload(project, clip, *, with_timecodes: bool, wait_seconds: int) -> Dict[str, Any]:
+    """Shared get/get_all body for one clip. Always returns text; adds lines
+    only when with_timecodes and they are available."""
+    status = _transcription_status(clip)
+    name = clip.GetName()
+    if status != "Transcribed":
+        return {
+            "name": name,
+            "status": status,
+            "text": None,
+            "note": "Clip is not transcribed. Run transcribe_clip_audio first.",
+        }
+    payload = {"name": name, "status": status, "text": _transcription_text(clip)}
+    if with_timecodes:
+        tc = _transcript_timecode_lines(project, clip, wait_seconds=wait_seconds)
+        payload.update(tc)
+    return payload
+
+
+@mcp.tool()
+def clip_transcript(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Read audio transcriptions from clips.
+
+    The MCP can trigger transcription (transcribe_clip_audio) but previously
+    could not read the result. This tool reads it: text by default, plus
+    frame-accurate caption-chunk timecodes on request.
+
+    Text comes from the clip property (clip-scoped). Timecodes come from the
+    current timeline's subtitle track (timeline-scoped) and only cover clips on
+    the open timeline.
+
+    Actions:
+      list() -> {clips: [{clip_id, name, status, char_count}], count}
+        Every clip whose transcription status is 'Transcribed'.
+      get(clip_id, with_timecodes=False, wait_seconds=30)
+        -> {name, status, text, lines?, granularity?, subtitle_track_created?}
+        with_timecodes=True generates captions on the current timeline if none
+        exist (mutates the timeline; async — polls up to wait_seconds).
+      get_all(with_timecodes=False, wait_seconds=30)
+        -> {transcripts: [{clip_id, name, status, text, ...}], count}
+        Pulls text for all transcribed clips. with_timecodes only populates
+        lines for clips on the current timeline.
+    """
+    p = params or {}
+    project, mp, err = _get_mp()
+    if err:
+        return err
+
+    if action == "list":
+        clips = []
+        for clip in get_all_media_pool_clips(mp):
+            status = _transcription_status(clip)
+            if status == "Transcribed":
+                clips.append({
+                    "clip_id": clip.GetUniqueId(),
+                    "name": clip.GetName(),
+                    "status": status,
+                    "char_count": len(_transcription_text(clip)),
+                })
+        return {"clips": clips, "count": len(clips)}
+
+    if action == "get":
+        clip_id = p.get("clip_id")
+        if not clip_id:
+            return {"error": "clip_id is required for action 'get'"}
+        clip = _find_clip_by_id(mp.GetRootFolder(), clip_id)
+        if not clip:
+            return {"error": f"Clip {clip_id} not found"}
+        return _build_transcript_payload(
+            project, clip,
+            with_timecodes=bool(p.get("with_timecodes", False)),
+            wait_seconds=int(p.get("wait_seconds", 30)),
+        )
+
+    if action == "get_all":
+        with_tc = bool(p.get("with_timecodes", False))
+        wait_seconds = int(p.get("wait_seconds", 30))
+        transcripts = []
+        for clip in get_all_media_pool_clips(mp):
+            if _transcription_status(clip) != "Transcribed":
+                continue
+            entry = _build_transcript_payload(
+                project, clip, with_timecodes=with_tc, wait_seconds=wait_seconds
+            )
+            entry["clip_id"] = clip.GetUniqueId()
+            transcripts.append(entry)
+        return {"transcripts": transcripts, "count": len(transcripts)}
+
+    return {"error": f"Unknown action '{action}'. Use list, get, or get_all."}
+
+
 @mcp.tool()
 def get_clip_audio_mapping(clip_id: str) -> Dict[str, Any]:
     """Get audio mapping for a clip.
