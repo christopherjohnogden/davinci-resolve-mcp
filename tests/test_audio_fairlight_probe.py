@@ -15,9 +15,18 @@ from src.server import (
 
 
 class MediaPoolItemStub:
-    def __init__(self, name="audio.mov", item_id="mpi-1"):
+    def __init__(self, name="audio.mov", item_id="mpi-1", clip_type="Video + Audio", synced_audio=""):
         self.name = name
         self.item_id = item_id
+        self.properties = {
+            "File Path": f"/tmp/{self.name}",
+            "Type": clip_type,
+            "Duration": "00:00:02:00",
+            "Synced Audio": synced_audio,
+            "Sound Roll #": synced_audio,
+            "Audio Offset": "0",
+            "Audio Ch": "1",
+        }
 
     def GetName(self):
         return self.name
@@ -26,7 +35,9 @@ class MediaPoolItemStub:
         return self.item_id
 
     def GetClipProperty(self, key=""):
-        return {"File Path": f"/tmp/{self.name}", "Type": "Video + Audio", "Duration": "00:00:02:00"}
+        if key:
+            return self.properties.get(key, "")
+        return dict(self.properties)
 
     def GetMediaId(self):
         return "media-1"
@@ -140,14 +151,16 @@ class FolderStub:
 
 
 class MediaPoolStub:
-    def __init__(self, clip=None):
+    def __init__(self, clip=None, clips=None):
         self.clip = clip or MediaPoolItemStub()
+        self.clips = clips or [self.clip]
+        self.auto_sync_calls = []
 
     def GetRootFolder(self):
         return self
 
     def GetClipList(self):
-        return [self.clip]
+        return self.clips
 
     def GetSubFolderList(self):
         return []
@@ -156,9 +169,15 @@ class MediaPoolStub:
         return FolderStub()
 
     def GetSelectedClips(self):
-        return [self.clip]
+        return self.clips
 
-    def AutoSyncAudio(self, clips, settings):
+    def AutoSyncAudio(self, clips, settings=None):
+        self.auto_sync_calls.append([clip.GetName() for clip in clips])
+        for clip in clips:
+            if "video" in str(clip.GetClipProperty("Type")).lower():
+                clip.properties["Synced Audio"] = "lav.wav"
+                clip.properties["Sound Roll #"] = "lav.wav"
+                clip.properties["Audio Offset"] = "12.34"
         return True
 
 
@@ -224,6 +243,27 @@ class AudioFairlightProbeTest(unittest.TestCase):
         self.assertEqual(settings["key:mode"], "mode:waveform")
         self.assertEqual(settings["key:channel"], -1)
         self.assertTrue(settings["key:retain_audio"])
+
+    def test_auto_sync_batches_multiple_cameras_against_same_lavs(self):
+        cam_a = MediaPoolItemStub("cam-a.mov", "cam-a", "Video + Audio")
+        cam_b = MediaPoolItemStub("cam-b.mov", "cam-b", "Video + Audio")
+        lav_a = MediaPoolItemStub("lav-a.wav", "lav-a", "Audio")
+        lav_b = MediaPoolItemStub("lav-b.wav", "lav-b", "Audio")
+        pool = MediaPoolStub(clips=[cam_a, cam_b, lav_a, lav_b])
+
+        dry = _safe_auto_sync_audio(pool, {"clip_ids": ["cam-a", "cam-b", "lav-a", "lav-b"], "dry_run": True})
+        result = _safe_auto_sync_audio(pool, {"clip_ids": ["cam-a", "cam-b", "lav-a", "lav-b"], "dry_run": False})
+
+        self.assertTrue(dry["batch_by_video"])
+        self.assertEqual(len(dry["execution_plan"]), 2)
+        self.assertTrue(result["batch_by_video"])
+        self.assertEqual(pool.auto_sync_calls, [
+            ["cam-a.mov", "lav-a.wav", "lav-b.wav"],
+            ["cam-b.mov", "lav-a.wav", "lav-b.wav"],
+        ])
+        self.assertEqual(result["linked_count"], 2)
+        self.assertEqual(result["linked"][0]["sound_roll"], "lav.wav")
+        self.assertEqual(result["linked"][0]["audio_offset"], "12.34")
 
     def test_subtitle_generation_probe_is_dry_run_by_default(self):
         timeline = TimelineStub()

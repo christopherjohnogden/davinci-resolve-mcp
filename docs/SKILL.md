@@ -754,6 +754,16 @@ helpers:
 - `voice_isolation_capabilities(track_index?, track_type?, item_index?)`
 - `audio_mapping_report(clip_ids?)`
 - `safe_auto_sync_audio(clip_ids|selected, settings?, dry_run?)`
+  - For multiple camera clips and candidate lav/audio files, pass all intended
+    clip IDs together; the compound server batches one camera at a time against
+    the same lav candidates by default.
+  - Trust readback fields (`linked`, `Synced Audio`, `Sound Roll #`,
+    `Audio Offset`), not `success` alone.
+  - Do not infer waveform-sync failure from timecode non-overlap alone;
+    waveform sync can ignore timecode. Use failed readback (`linked_count == 0`)
+    as the proof.
+  - Omit `settings` for waveform+replace default, or pass
+    `settings={"append": true}` to retain camera scratch audio.
 - `transcription_capabilities(clip_ids?|selected?)`
 - `subtitle_generation_probe(settings?, allow_generate?)`
 - `fairlight_boundary_report`

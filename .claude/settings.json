@@ -11,7 +11,13 @@
       "Bash(venv/bin/python -c \"import ast; ast.parse\\(open\\('src/server.py'\\).read\\(\\)\\); print\\('parses OK'\\)\")",
       "Bash(venv/bin/python -c \"import src.server; print\\('imports OK'\\)\")",
       "Bash(awk '{print $1, $2, $NF}')",
-      "Bash(awk '$2 > \"10:34:42\" && /audio|sync/ {print \"  AFTER \\(app missing this\\):\", $0}')"
+      "Bash(awk '$2 > \"10:34:42\" && /audio|sync/ {print \"  AFTER \\(app missing this\\):\", $0}')",
+      "Bash(ls -la apps)",
+      "Bash(find . -name package.json -not -path '*/node_modules/*' -maxdepth 4)",
+      "Bash(git log *)",
+      "Bash(git status *)",
+      "Bash(ls apps/resolve-chat-panel/node_modules/.bin)",
+      "Bash(grep -m1 '\"name\"' apps/resolve-chat-panel/node_modules/.package-lock.json)"
     ]
   }
 }

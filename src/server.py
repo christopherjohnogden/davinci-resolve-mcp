@@ -5278,8 +5278,103 @@ def _safe_auto_sync_audio(mp, p: Dict[str, Any]):
     # (AUDIO_SYNC_MODE, ...). Always pass a live resolve handle so normalization
     # emits enum keys, never the global which may be None at call time.
     settings = _normalize_auto_sync_settings(dict(p.get("settings") or {}), get_resolve())
+    video_clips, audio_clips, other_clips = _partition_auto_sync_clips(clips)
+    batch_by_video = p.get("batch_by_video", p.get("per_video", True))
     if p.get("dry_run", True):
-        return _ok(would_auto_sync=True, clips=_clip_summaries(clips), missing=missing, settings=settings)
+        dry = _ok(would_auto_sync=True, clips=_clip_summaries(clips), missing=missing, settings=settings)
+        if batch_by_video and len(video_clips) > 1 and audio_clips:
+            dry.update({
+                "batch_by_video": True,
+                "execution_plan": [
+                    {
+                        "video": _media_pool_item_summary(video),
+                        "audio_candidates": _clip_summaries(audio_clips),
+                        "clip_ids": [video.GetUniqueId(), *[audio.GetUniqueId() for audio in audio_clips]],
+                    }
+                    for video in video_clips
+                ],
+                "guidance": (
+                    "Multiple camera clips plus audio candidates detected. Execute one camera "
+                    "at a time against the same lav candidates, then trust readback fields "
+                    "`Synced Audio`, `Sound Roll #`, and `Audio Offset`."
+                ),
+            })
+            if other_clips:
+                dry["ignored_for_batch"] = _clip_summaries(other_clips)
+        return dry
+
+    if batch_by_video and len(video_clips) > 1 and audio_clips:
+        batch_results = []
+        aggregate_linked = []
+        aggregate_newly_linked = []
+        for video in video_clips:
+            run_clips = [video, *audio_clips]
+            result = _execute_auto_sync_audio(mp, run_clips, settings)
+            result["video"] = _media_pool_item_summary(video)
+            result["audio_candidates"] = _clip_summaries(audio_clips)
+            batch_results.append(result)
+            aggregate_linked.extend(result.get("linked") or [])
+            aggregate_newly_linked.extend(result.get("newly_linked") or [])
+        return {
+            "success": all(bool(result.get("success")) for result in batch_results),
+            "batch_by_video": True,
+            "batch_results": batch_results,
+            "linked": aggregate_linked,
+            "linked_count": len(aggregate_linked),
+            "newly_linked": aggregate_newly_linked,
+            "newly_linked_count": len(aggregate_newly_linked),
+            "already_linked": sum(int(result.get("already_linked") or 0) for result in batch_results),
+            "count": len(clips),
+            "video_count": len(video_clips),
+            "audio_candidate_count": len(audio_clips),
+            "missing": missing,
+            "settings": settings,
+            "readback_fields": ["Synced Audio", "Sound Roll #", "Audio Offset"],
+            **({"ignored_for_batch": _clip_summaries(other_clips)} if other_clips else {}),
+        }
+
+    return _execute_auto_sync_audio(mp, clips, settings, missing=missing)
+
+
+def _partition_auto_sync_clips(clips):
+    video_clips = []
+    audio_clips = []
+    other_clips = []
+    for clip in clips:
+        try:
+            clip_type = str(clip.GetClipProperty("Type") or "").strip().lower()
+        except Exception:
+            clip_type = ""
+        if "video" in clip_type:
+            video_clips.append(clip)
+        elif clip_type == "audio" or ("audio" in clip_type and "video" not in clip_type):
+            audio_clips.append(clip)
+        else:
+            other_clips.append(clip)
+    return video_clips, audio_clips, other_clips
+
+
+def _auto_sync_readback(clip):
+    try:
+        props = clip.GetClipProperty() or {}
+    except Exception:
+        props = {}
+    def _prop(name):
+        try:
+            return clip.GetClipProperty(name) or props.get(name) or ""
+        except Exception:
+            return props.get(name) or ""
+    return {
+        "clip": clip.GetName(),
+        "clip_id": clip.GetUniqueId(),
+        "synced_audio": _prop("Synced Audio"),
+        "sound_roll": _prop("Sound Roll #"),
+        "audio_offset": _prop("Audio Offset"),
+        "audio_ch": _prop("Audio Ch"),
+    }
+
+
+def _execute_auto_sync_audio(mp, clips, settings, missing=None):
     # Capture each clip's Synced Audio link BEFORE, so we can report what
     # actually changed rather than trusting AutoSyncAudio's boolean alone.
     def _synced_audio(clip):
@@ -5305,9 +5400,9 @@ def _safe_auto_sync_audio(mp, p: Dict[str, Any]):
     linked = []          # every clip that currently has synced audio (the truth)
     newly_linked = []    # clips whose synced audio changed as a result of THIS call
     for c in clips:
-        after = _synced_audio(c)
+        entry = _auto_sync_readback(c)
+        after = entry.get("synced_audio") or ""
         if after:
-            entry = {"clip": c.GetName(), "synced_audio": after}
             linked.append(entry)
             if after != before.get(c.GetUniqueId(), ""):
                 newly_linked.append(entry)
@@ -5319,8 +5414,9 @@ def _safe_auto_sync_audio(mp, p: Dict[str, Any]):
         "newly_linked_count": len(newly_linked),
         "already_linked": len(linked) - len(newly_linked),
         "count": len(clips),
-        "missing": missing,
+        "missing": missing or [],
         "settings": settings,
+        "readback_fields": ["Synced Audio", "Sound Roll #", "Audio Offset"],
     }
 
 
@@ -16018,6 +16114,22 @@ _ACTION_HELP: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
     },
     "timeline": {
+        "safe_auto_sync_audio": {
+            "summary": "Source-safe Resolve waveform/timecode auto-sync wrapper with per-camera batching and readback verification.",
+            "params": "clip_ids|selected, settings? ({syncBy:'waveform', channel:'auto', append?}), dry_run? (default true), batch_by_video? (default true)",
+            "returns": "{success, batch_by_video?, linked, linked_count, newly_linked, batch_results?, readback_fields}",
+            "example": (
+                'timeline(action="safe_auto_sync_audio", params={\n'
+                '  "clip_ids": ["camA_id", "camB_id", "lav1_id", "lav2_id"],\n'
+                '  "settings": {"syncBy": "waveform", "channel": "auto"},\n'
+                '  "dry_run": False\n'
+                '})\n'
+                '# If multiple camera clips plus lavs are supplied, the tool runs one camera\n'
+                '# at a time against all lav candidates. Report only readback: linked,\n'
+                '# Synced Audio, Sound Roll #, and Audio Offset. Do not infer failure from\n'
+                '# timecode non-overlap alone; waveform sync can ignore timecode.'
+            ),
+        },
         "duplicate_clips": {
             "summary": "Re-place the same MediaPool media with the same source trim. Video clips only.",
             "params": "clip_ids?|selected?, target_track_index?|track_offset?, placement? (same_time|offset|at_playhead|track_above|after_source|next_gap), record_frame?, record_frame_offset?, copy_properties?, include_linked?",
