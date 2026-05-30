@@ -288,7 +288,7 @@ High-value workflows:
 - Media ingest: use media_pool.ingest_capabilities, safe_import_media/safe_import_sequence, organize_clips, normalize_metadata, and relink planning actions.
 - Color: use timeline_item_color.grade_boundary_report, probe_node_graph, safe_set_cdl, safe_apply_drx, grade_version_snapshot/restore, and gallery/color-group capability actions.
 - Fusion: use fusion_comp.fusion_boundary_report, probe_fusion_comp, safe_add_tool, safe_set_inputs, and safe_connect_tools.
-- Audio/Fairlight: use timeline.fairlight_boundary_report, probe_audio_track/item, voice_isolation_capabilities, safe_auto_sync_audio, and subtitle_generation_probe. For safe_auto_sync_audio, trust the returned `linked` list (clips that actually got synced audio), not `success` — a sync can return success:true yet link nothing when no waveform matches. Sync one video against candidate lavs and read back which lav is in `linked`; omit `settings` for the reliable default.
+- Audio/Fairlight: use timeline.fairlight_boundary_report, probe_audio_track/item, voice_isolation_capabilities, safe_auto_sync_audio, and subtitle_generation_probe. For safe_auto_sync_audio, trust the returned `linked` list (clips that actually got synced audio), not `success` — a sync can return success:true yet link nothing when no waveform matches. Sync one video against candidate lavs and read back which lav is in `linked`; omit `settings` for the reliable waveform+replace default, or pass `settings: {"append": true}` to keep embedded scratch audio.
 - Render/deliver: use render.export_render_boundary_report, validate_render_settings, safe_set_render_settings, prepare_render_job, and safe_quick_export.
 - Project lifecycle: use project_manager.project_boundary_report and safe project/database/archive actions. Keep destructive work scoped to disposable _mcp_ projects unless the user explicitly approves otherwise.
 - Extension authoring: use script_plugin.extension_boundary_report and safe_install_extension/safe_remove_extension. Respect refresh/restart requirements.
@@ -5369,6 +5369,10 @@ def _normalize_auto_sync_settings(settings: Dict[str, Any], resolve_obj=None):
     for source_key, target_key in (
         ("retainEmbeddedAudio", retain_embedded_key),
         ("retain_embedded_audio", retain_embedded_key),
+        ("retain_embedded", retain_embedded_key),
+        ("keepEmbeddedAudio", retain_embedded_key),
+        ("keep_embedded_audio", retain_embedded_key),
+        ("append", retain_embedded_key),
         ("retainVideoMetadata", retain_metadata_key),
         ("retain_video_metadata", retain_metadata_key),
     ):
@@ -5379,7 +5383,9 @@ def _normalize_auto_sync_settings(settings: Dict[str, Any], resolve_obj=None):
     # leftover string key would make AutoSyncAudio fail.
     known_aliases = {
         "syncBy", "sync_by", "mode", "channelNumber", "channel_number", "channel",
-        "retainEmbeddedAudio", "retain_embedded_audio", "retainVideoMetadata", "retain_video_metadata",
+        "retainEmbeddedAudio", "retain_embedded_audio", "retain_embedded",
+        "keepEmbeddedAudio", "keep_embedded_audio", "append",
+        "retainVideoMetadata", "retain_video_metadata",
     }
     for key, value in settings.items():
         if key in known_aliases:
@@ -14456,7 +14462,8 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         clip as synced ONLY if it appears in `linked`. To match one video against
         several candidate lavs, pass [video_id, lav1_id, lav2_id, ...] and read
         back which lav appears in `linked`. Omit `settings` for the reliable
-        waveform+replace default; an empty/normalized settings dict is fine.
+        waveform+replace default; use settings.append=true (alias for
+        retainEmbeddedAudio=true) to keep camera scratch audio.
       transcription_capabilities(clip_ids?|selected?) -> {clip_methods, folder}
       subtitle_generation_probe(settings?, allow_generate?) -> {success}
       fairlight_boundary_report(...) -> {capabilities, track, item, audio_mapping, transcription}

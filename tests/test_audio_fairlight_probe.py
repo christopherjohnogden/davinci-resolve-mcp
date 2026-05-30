@@ -3,6 +3,7 @@ import unittest
 from src.server import (
     _audio_capabilities,
     _audio_mapping_report,
+    _normalize_auto_sync_settings,
     _audio_track_probe,
     _probe_audio_item,
     _safe_auto_sync_audio,
@@ -161,6 +162,16 @@ class MediaPoolStub:
         return True
 
 
+class ResolveAudioSyncStub:
+    AUDIO_SYNC_MODE = "key:mode"
+    AUDIO_SYNC_CHANNEL_NUMBER = "key:channel"
+    AUDIO_SYNC_RETAIN_EMBEDDED_AUDIO = "key:retain_audio"
+    AUDIO_SYNC_RETAIN_VIDEO_METADATA = "key:retain_meta"
+
+    AUDIO_SYNC_WAVEFORM = "mode:waveform"
+    AUDIO_SYNC_CHANNEL_AUTOMATIC = -1
+
+
 class AudioFairlightProbeTest(unittest.TestCase):
     def test_capabilities_include_voice_and_transcription(self):
         caps = _audio_capabilities()
@@ -203,6 +214,16 @@ class AudioFairlightProbeTest(unittest.TestCase):
         self.assertTrue(sync["success"])
         self.assertTrue(sync["would_auto_sync"])
         self.assertTrue(transcription["clip_methods"][0]["transcribe_audio"])
+
+    def test_auto_sync_append_alias_maps_to_retain_embedded_audio(self):
+        settings = _normalize_auto_sync_settings(
+            {"syncBy": "waveform", "channel": "auto", "append": True},
+            ResolveAudioSyncStub(),
+        )
+
+        self.assertEqual(settings["key:mode"], "mode:waveform")
+        self.assertEqual(settings["key:channel"], -1)
+        self.assertTrue(settings["key:retain_audio"])
 
     def test_subtitle_generation_probe_is_dry_run_by_default(self):
         timeline = TimelineStub()

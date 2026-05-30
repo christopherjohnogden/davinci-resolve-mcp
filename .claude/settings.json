@@ -3,7 +3,15 @@
     "allow": [
       "Bash(venv/bin/python -c \"import ast; ast.parse\\(open\\('src/server.py'\\).read\\(\\)\\); print\\('main server.py parses OK'\\)\")",
       "Bash(git stash *)",
-      "Bash(venv/bin/python -c ' *)"
+      "Bash(venv/bin/python -c ' *)",
+      "Bash(ps -eo pid,etime,command)",
+      "Bash(ps -eo pid,lstart,etime,command)",
+      "Bash(awk '{print $1, $2}')",
+      "Bash(ps -eo pid,lstart,command)",
+      "Bash(venv/bin/python -c \"import ast; ast.parse\\(open\\('src/server.py'\\).read\\(\\)\\); print\\('parses OK'\\)\")",
+      "Bash(venv/bin/python -c \"import src.server; print\\('imports OK'\\)\")",
+      "Bash(awk '{print $1, $2, $NF}')",
+      "Bash(awk '$2 > \"10:34:42\" && /audio|sync/ {print \"  AFTER \\(app missing this\\):\", $0}')"
     ]
   }
 }
