@@ -961,10 +961,68 @@ def _join_subtitle_text(tc: Dict[str, Any]) -> str:
     return "\n".join(p for p in parts if p)
 
 
-def _build_transcript_payload(project, clip, *, with_timecodes: bool, wait_seconds: int) -> Dict[str, Any]:
+def _clip_scoped_subtitle_text(project, mp, clip, *, wait_seconds: int) -> Dict[str, Any]:
+    """Get the FULL transcript for ONE specific clip via a throwaway timeline.
+
+    Resolve's "Transcription" clip property is truncated, and the only complete
+    source is a subtitle track — but a subtitle track is timeline-scoped, so
+    reading the *current* timeline's captions would return some other clip's
+    text. To stay clip-scoped, build a temporary timeline containing only this
+    clip, generate captions on it, read them, then delete the temp timeline and
+    restore whatever timeline was current. Never raises.
+
+    Returns {"text": <full>} on success, or {"note": <why not>} otherwise.
+    """
+    if not project or not mp:
+        return {"note": "Full transcript needs project access; showing truncated preview."}
+
+    prev_tl = None
+    temp_tl = None
+    temp_name = "__mcp_transcript_probe__"
+    try:
+        try:
+            prev_tl = project.GetCurrentTimeline()
+        except Exception:
+            prev_tl = None
+
+        try:
+            temp_tl = mp.CreateTimelineFromClips(temp_name, [clip])
+        except Exception as exc:
+            return {"note": f"Could not build a timeline to read the full transcript: {exc}"}
+        if not temp_tl:
+            return {"note": "Could not build a timeline to read the full transcript."}
+
+        try:
+            project.SetCurrentTimeline(temp_tl)
+        except Exception:
+            pass
+
+        # _transcript_timecode_lines reads (and, if needed, generates) the
+        # current timeline's subtitles — now that timeline is THIS clip only.
+        tc = _transcript_timecode_lines(project, clip, wait_seconds=wait_seconds)
+        full = _join_subtitle_text(tc)
+        if full:
+            return {"text": full}
+        return {"note": tc.get("note", "Full transcript unavailable; showing truncated preview.")}
+    finally:
+        # Clean up: restore the previous timeline, then delete the temp one.
+        if prev_tl is not None:
+            try:
+                project.SetCurrentTimeline(prev_tl)
+            except Exception:
+                pass
+        if temp_tl is not None:
+            try:
+                mp.DeleteTimelines([temp_tl])
+            except Exception:
+                pass
+
+
+def _build_transcript_payload(project, mp, clip, *, with_timecodes: bool, wait_seconds: int) -> Dict[str, Any]:
     """Shared get/get_all body for one clip. Always returns text; replaces a
-    truncated property preview with the full subtitle-track text when possible.
-    Adds caption lines only when with_timecodes and they are available."""
+    truncated property preview with the full transcript read from a clip-scoped
+    temporary timeline. Adds caption lines (timeline-scoped) only when
+    with_timecodes and they are available on the current timeline."""
     status = _transcription_status(clip)
     name = clip.GetName()
     if status != "Transcribed":
@@ -978,35 +1036,32 @@ def _build_transcript_payload(project, clip, *, with_timecodes: bool, wait_secon
     text = _transcription_text(clip)        # fast path: clip property
     source = "property"
     truncated = _is_truncated(text)
-    tc = None
-    lines = None
     note = None
 
-    if truncated or with_timecodes:
-        tc = _transcript_timecode_lines(project, clip, wait_seconds=wait_seconds)
-        lines = tc.get("lines")
-        full = _join_subtitle_text(tc)
-        if truncated:
-            if full:
-                text, source = full, "subtitles"
-            else:
-                note = tc.get("note", "Full transcript unavailable; showing truncated preview.")
+    if truncated:
+        # Full text is clip-scoped: read it from a temp timeline of this clip
+        # only, so we never return a different clip's captions.
+        result = _clip_scoped_subtitle_text(project, mp, clip, wait_seconds=wait_seconds)
+        if result.get("text"):
+            text, source = result["text"], "subtitles"
+        else:
+            note = result.get("note", "Full transcript unavailable; showing truncated preview.")
 
     payload = {"name": name, "status": status, "text": text,
                "source": source, "truncated": truncated}
     if note:
         payload["note"] = note
-    if with_timecodes and tc is not None:
-        # Spread timecode-level fields: lines, granularity, subtitle_track_created, note.
-        if lines is not None:
-            payload["lines"] = lines
+
+    # Timecodes remain timeline-scoped (they only make sense relative to the
+    # clip's placement on the current timeline). Caller opts in explicitly.
+    if with_timecodes:
+        tc = _transcript_timecode_lines(project, clip, wait_seconds=wait_seconds)
+        if tc.get("lines") is not None:
+            payload["lines"] = tc["lines"]
         for key in ("granularity", "subtitle_track_created"):
             if key in tc:
                 payload[key] = tc[key]
         if "note" in tc:
-            # tc note wins over any truncation note: it directly answers the
-            # with_timecodes request and, when no timeline exists, explains why both
-            # the full text and the timecodes are unavailable.
             payload["note"] = tc["note"]
     return payload
 
@@ -1162,7 +1217,7 @@ def clip_transcript(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         if not clip:
             return {"error": f"Clip {clip_id} not found"}
         return _build_transcript_payload(
-            project, clip,
+            project, mp, clip,
             with_timecodes=bool(p.get("with_timecodes", False)),
             wait_seconds=int(p.get("wait_seconds", 30)),
         )
@@ -1175,7 +1230,7 @@ def clip_transcript(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
             if _transcription_status(clip) != "Transcribed":
                 continue
             entry = _build_transcript_payload(
-                project, clip, with_timecodes=with_tc, wait_seconds=wait_seconds
+                project, mp, clip, with_timecodes=with_tc, wait_seconds=wait_seconds
             )
             entry["clip_id"] = clip.GetUniqueId()
             transcripts.append(entry)

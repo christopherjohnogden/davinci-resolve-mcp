@@ -109,6 +109,50 @@ class FakeProject:
     def GetCurrentTimeline(self):
         return self._timeline
 
+    def SetCurrentTimeline(self, tl):
+        self._timeline = tl
+        return True
+
+
+class _FakeEmptyTimeline:
+    """A temp timeline whose audio yields no captions even after generation —
+    models a clip for which Resolve produces no subtitles."""
+    def GetSetting(self, key):
+        return "24" if key == "timelineFrameRate" else None
+    def GetTrackCount(self, ttype):
+        return 0
+    def GetItemListInTrack(self, ttype, idx):
+        return []
+    def CreateSubtitlesFromAudio(self, settings):
+        return False
+
+
+class FakeMediaPoolForTranscript:
+    """Media pool whose CreateTimelineFromClips returns a timeline preloaded
+    with the given clip-scoped subtitle items, modelling the temp-timeline that
+    _clip_scoped_subtitle_text builds. Set subtitle_items=None to simulate a
+    clip that yields no captions (full text unavailable)."""
+
+    def __init__(self, subtitle_items=None, create_returns=True):
+        self._subtitle_items = subtitle_items
+        self._create_returns = create_returns
+        self.created = []
+        self.deleted = []
+
+    def CreateTimelineFromClips(self, name, clips):
+        if not self._create_returns:
+            return None
+        if self._subtitle_items is None:
+            tl = _FakeEmptyTimeline()      # generates no captions
+        else:
+            tl = FakeTimeline(subtitle_items=self._subtitle_items, fps="24")
+        self.created.append(name)
+        return tl
+
+    def DeleteTimelines(self, timelines):
+        self.deleted.extend(timelines)
+        return True
+
 
 class _Patch:
     """Patch the module's _get_mp / get_all_media_pool_clips / _find_clip_by_id."""
@@ -325,46 +369,54 @@ class IsTruncatedTests(unittest.TestCase):
 
 
 class TranscriptTruncationFallbackTests(unittest.TestCase):
-    def test_truncated_property_falls_back_to_subtitles(self):
+    def test_truncated_property_falls_back_to_clip_scoped_subtitles(self):
+        # Full text comes from a temp timeline built for THIS clip only.
         clip = FakeClip("c1", "Clip1", status="Transcribed", text="Hello world…")
-        tl = FakeTimeline(subtitle_items=[
+        mp = FakeMediaPoolForTranscript(subtitle_items=[
             FakeSubtitleItem("Hello world, this is the full thing.", 0, 24),
-        ], fps="24")
+        ])
         res = mpi._build_transcript_payload(
-            FakeProject(tl), clip, with_timecodes=False, wait_seconds=1)
+            FakeProject(None), mp, clip, with_timecodes=False, wait_seconds=1)
         self.assertEqual(res["source"], "subtitles")
         self.assertTrue(res["truncated"])
         self.assertEqual(res["text"], "Hello world, this is the full thing.")
+        # temp timeline was created AND cleaned up
+        self.assertEqual(len(mp.created), 1)
+        self.assertEqual(len(mp.deleted), 1)
 
-    def test_complete_property_used_directly_no_subtitle_build(self):
+    def test_complete_property_used_directly_no_temp_timeline(self):
         clip = FakeClip("c1", "Clip1", status="Transcribed", text="Short and complete.")
+        mp = FakeMediaPoolForTranscript(subtitle_items=[FakeSubtitleItem("x", 0, 1)])
         res = mpi._build_transcript_payload(
-            FakeProject(None), clip, with_timecodes=False, wait_seconds=1)
+            FakeProject(None), mp, clip, with_timecodes=False, wait_seconds=1)
         self.assertEqual(res["source"], "property")
         self.assertFalse(res["truncated"])
         self.assertEqual(res["text"], "Short and complete.")
+        # not truncated → no temp timeline built at all
+        self.assertEqual(len(mp.created), 0)
 
     def test_truncated_but_subtitles_unavailable_keeps_property(self):
         clip = FakeClip("c1", "Clip1", status="Transcribed", text="Partial…")
+        # temp timeline yields no subtitles → keep the truncated property text
+        mp = FakeMediaPoolForTranscript(subtitle_items=None)
         res = mpi._build_transcript_payload(
-            FakeProject(None), clip, with_timecodes=False, wait_seconds=1)
+            FakeProject(None), mp, clip, with_timecodes=False, wait_seconds=1)
         self.assertEqual(res["source"], "property")
         self.assertTrue(res["truncated"])
         self.assertEqual(res["text"], "Partial…")
         self.assertIn("note", res)
+        self.assertEqual(len(mp.deleted), 1)  # still cleaned up
 
-    def test_truncated_with_timecodes_returns_full_text_and_lines(self):
-        clip = FakeClip("c1", "Clip1", status="Transcribed", text="Hello…")
-        tl = FakeTimeline(subtitle_items=[
-            FakeSubtitleItem("Hello world, the full thing.", 0, 24),
-        ], fps="24")
+    def test_truncated_temp_timeline_creation_fails_keeps_property(self):
+        clip = FakeClip("c1", "Clip1", status="Transcribed", text="Partial…")
+        mp = FakeMediaPoolForTranscript(create_returns=False)
         res = mpi._build_transcript_payload(
-            FakeProject(tl), clip, with_timecodes=True, wait_seconds=1)
-        self.assertEqual(res["source"], "subtitles")
+            FakeProject(None), mp, clip, with_timecodes=False, wait_seconds=1)
+        self.assertEqual(res["source"], "property")
         self.assertTrue(res["truncated"])
-        self.assertEqual(res["text"], "Hello world, the full thing.")
-        self.assertIn("lines", res)
-        self.assertEqual(len(res["lines"]), 1)
+        self.assertEqual(res["text"], "Partial…")
+        self.assertIn("note", res)
+        self.assertEqual(len(mp.deleted), 0)  # nothing to delete
 
 
 if __name__ == "__main__":
