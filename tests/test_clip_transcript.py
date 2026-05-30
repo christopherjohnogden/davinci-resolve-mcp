@@ -324,5 +324,35 @@ class IsTruncatedTests(unittest.TestCase):
         self.assertFalse(mpi._is_truncated(None))
 
 
+class TranscriptTruncationFallbackTests(unittest.TestCase):
+    def test_truncated_property_falls_back_to_subtitles(self):
+        clip = FakeClip("c1", "Clip1", status="Transcribed", text="Hello world…")
+        tl = FakeTimeline(subtitle_items=[
+            FakeSubtitleItem("Hello world, this is the full thing.", 0, 24),
+        ], fps="24")
+        res = mpi._build_transcript_payload(
+            FakeProject(tl), clip, with_timecodes=False, wait_seconds=1)
+        self.assertEqual(res["source"], "subtitles")
+        self.assertTrue(res["truncated"])
+        self.assertEqual(res["text"], "Hello world, this is the full thing.")
+
+    def test_complete_property_used_directly_no_subtitle_build(self):
+        clip = FakeClip("c1", "Clip1", status="Transcribed", text="Short and complete.")
+        res = mpi._build_transcript_payload(
+            FakeProject(None), clip, with_timecodes=False, wait_seconds=1)
+        self.assertEqual(res["source"], "property")
+        self.assertFalse(res["truncated"])
+        self.assertEqual(res["text"], "Short and complete.")
+
+    def test_truncated_but_subtitles_unavailable_keeps_property(self):
+        clip = FakeClip("c1", "Clip1", status="Transcribed", text="Partial…")
+        res = mpi._build_transcript_payload(
+            FakeProject(None), clip, with_timecodes=False, wait_seconds=1)
+        self.assertEqual(res["source"], "property")
+        self.assertTrue(res["truncated"])
+        self.assertEqual(res["text"], "Partial…")
+        self.assertIn("note", res)
+
+
 if __name__ == "__main__":
     unittest.main()

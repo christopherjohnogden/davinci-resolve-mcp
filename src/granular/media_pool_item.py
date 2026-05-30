@@ -962,8 +962,9 @@ def _join_subtitle_text(tc: Dict[str, Any]) -> str:
 
 
 def _build_transcript_payload(project, clip, *, with_timecodes: bool, wait_seconds: int) -> Dict[str, Any]:
-    """Shared get/get_all body for one clip. Always returns text; adds lines
-    only when with_timecodes and they are available."""
+    """Shared get/get_all body for one clip. Always returns text; replaces a
+    truncated property preview with the full subtitle-track text when possible.
+    Adds caption lines only when with_timecodes and they are available."""
     status = _transcription_status(clip)
     name = clip.GetName()
     if status != "Transcribed":
@@ -973,10 +974,43 @@ def _build_transcript_payload(project, clip, *, with_timecodes: bool, wait_secon
             "text": None,
             "note": "Clip is not transcribed. Run transcribe_clip_audio first.",
         }
-    payload = {"name": name, "status": status, "text": _transcription_text(clip)}
-    if with_timecodes:
+
+    text = _transcription_text(clip)        # fast path: clip property
+    source = "property"
+    truncated = _is_truncated(text)
+    tc = None
+    lines = None
+    note = None
+
+    if truncated or with_timecodes:
         tc = _transcript_timecode_lines(project, clip, wait_seconds=wait_seconds)
-        payload.update(tc)
+        lines = tc.get("lines")
+        full = _join_subtitle_text(tc)
+        if truncated:
+            if full:
+                text, source = full, "subtitles"
+            else:
+                note = tc.get("note", "Full transcript unavailable; showing truncated preview.")
+
+    payload = {"name": name, "status": status, "text": text,
+               "source": source, "truncated": truncated}
+    if note:
+        payload["note"] = note
+    if with_timecodes and tc is not None:
+        # Spread timecode-level fields: lines, granularity, subtitle_track_created, note.
+        if lines is not None:
+            payload["lines"] = lines
+        for key in ("granularity", "subtitle_track_created"):
+            if key in tc:
+                payload[key] = tc[key]
+        # If tc only has a "note" (e.g. no timeline), propagate it (may override
+        # the truncation note set above, but with_timecodes note is more specific).
+        if "note" in tc and not note:
+            payload["note"] = tc["note"]
+        elif "note" in tc and note:
+            # Both truncation and timecode have notes — timecode note wins since
+            # it directly answers the with_timecodes request.
+            payload["note"] = tc["note"]
     return payload
 
 
