@@ -953,6 +953,14 @@ def _transcript_timecode_lines(project, clip, *, wait_seconds: int = 30) -> Dict
     }
 
 
+def _join_subtitle_text(tc: Dict[str, Any]) -> str:
+    """Join the text of subtitle caption lines (from _transcript_timecode_lines)
+    into the full transcript. Returns '' when no lines are present."""
+    lines = (tc or {}).get("lines") or []
+    parts = [str(ln.get("text", "")).strip() for ln in lines]
+    return "\n".join(p for p in parts if p)
+
+
 def _build_transcript_payload(project, clip, *, with_timecodes: bool, wait_seconds: int) -> Dict[str, Any]:
     """Shared get/get_all body for one clip. Always returns text; adds lines
     only when with_timecodes and they are available."""

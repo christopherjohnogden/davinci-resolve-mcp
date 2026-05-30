@@ -290,6 +290,22 @@ class ClipTranscriptTests(unittest.TestCase):
         self.assertIn("Unknown scope", res["error"])
 
 
+class JoinSubtitleTextTests(unittest.TestCase):
+    def test_joins_line_texts_with_newlines(self):
+        tc = {"lines": [{"text": "First line."}, {"text": "Second line."}]}
+        self.assertEqual(mpi._join_subtitle_text(tc), "First line.\nSecond line.")
+
+    def test_skips_blank_segments(self):
+        tc = {"lines": [{"text": "A"}, {"text": ""}, {"text": "B"}]}
+        self.assertEqual(mpi._join_subtitle_text(tc), "A\nB")
+
+    def test_note_only_returns_empty(self):
+        self.assertEqual(mpi._join_subtitle_text({"note": "unavailable"}), "")
+
+    def test_missing_lines_returns_empty(self):
+        self.assertEqual(mpi._join_subtitle_text({}), "")
+
+
 class IsTruncatedTests(unittest.TestCase):
     def test_trailing_ellipsis_glyph_is_truncated(self):
         self.assertTrue(mpi._is_truncated("a long transcript…"))
