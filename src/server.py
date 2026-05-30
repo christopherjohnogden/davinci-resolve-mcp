@@ -5280,6 +5280,15 @@ def _safe_auto_sync_audio(mp, p: Dict[str, Any]):
     settings = _normalize_auto_sync_settings(dict(p.get("settings") or {}), get_resolve())
     if p.get("dry_run", True):
         return _ok(would_auto_sync=True, clips=_clip_summaries(clips), missing=missing, settings=settings)
+    # Capture each clip's Synced Audio link BEFORE, so we can report what
+    # actually changed rather than trusting AutoSyncAudio's boolean alone.
+    def _synced_audio(clip):
+        try:
+            return clip.GetClipProperty("Synced Audio") or ""
+        except Exception:
+            return ""
+    before = {c.GetUniqueId(): _synced_audio(c) for c in clips}
+
     # AutoSyncAudio succeeds with no/empty settings; only pass settings when we
     # actually produced valid (enum-keyed) entries, so a normalization miss
     # degrades to the working no-settings call instead of a False-returning one.
@@ -5287,7 +5296,23 @@ def _safe_auto_sync_audio(mp, p: Dict[str, Any]):
         ok = bool(mp.AutoSyncAudio(clips, settings))
     else:
         ok = bool(mp.AutoSyncAudio(clips))
-    return {"success": ok, "count": len(clips), "missing": missing, "settings": settings}
+
+    # Verify by reading back the Synced Audio property — AutoSyncAudio's boolean
+    # is not sufficient proof. Report which clips are now linked and to what, so
+    # a caller never has to trust an unverified "success".
+    linked = []
+    for c in clips:
+        after = _synced_audio(c)
+        if after and after != before.get(c.GetUniqueId(), ""):
+            linked.append({"clip": c.GetName(), "synced_audio": after})
+    return {
+        "success": ok,
+        "linked": linked,                 # clips whose Synced Audio changed this call
+        "newly_linked_count": len(linked),
+        "count": len(clips),
+        "missing": missing,
+        "settings": settings,
+    }
 
 
 def _resolve_audio_constant(resolve_obj, name: str, fallback):
