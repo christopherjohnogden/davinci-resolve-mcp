@@ -5273,10 +5273,21 @@ def _safe_auto_sync_audio(mp, p: Dict[str, Any]):
     if err:
         return err
     clips, missing = resolved
-    settings = _normalize_auto_sync_settings(dict(p.get("settings") or {}), resolve)
+    # Resolve's AutoSyncAudio silently returns False if the settings dict uses
+    # string keys (e.g. "syncMode"); it only accepts its numeric enum constants
+    # (AUDIO_SYNC_MODE, ...). Always pass a live resolve handle so normalization
+    # emits enum keys, never the global which may be None at call time.
+    settings = _normalize_auto_sync_settings(dict(p.get("settings") or {}), get_resolve())
     if p.get("dry_run", True):
         return _ok(would_auto_sync=True, clips=_clip_summaries(clips), missing=missing, settings=settings)
-    return {"success": bool(mp.AutoSyncAudio(clips, settings)), "count": len(clips), "missing": missing, "settings": settings}
+    # AutoSyncAudio succeeds with no/empty settings; only pass settings when we
+    # actually produced valid (enum-keyed) entries, so a normalization miss
+    # degrades to the working no-settings call instead of a False-returning one.
+    if settings:
+        ok = bool(mp.AutoSyncAudio(clips, settings))
+    else:
+        ok = bool(mp.AutoSyncAudio(clips))
+    return {"success": ok, "count": len(clips), "missing": missing, "settings": settings}
 
 
 def _resolve_audio_constant(resolve_obj, name: str, fallback):
@@ -5289,27 +5300,37 @@ def _normalize_auto_sync_settings(settings: Dict[str, Any], resolve_obj=None):
     if not settings:
         return settings
     normalized = {}
-    mode_key = _resolve_audio_constant(resolve_obj, "AUDIO_SYNC_MODE", "syncMode")
-    channel_key = _resolve_audio_constant(resolve_obj, "AUDIO_SYNC_CHANNEL_NUMBER", "channelNumber")
-    retain_embedded_key = _resolve_audio_constant(resolve_obj, "AUDIO_SYNC_RETAIN_EMBEDDED_AUDIO", "retainEmbeddedAudio")
-    retain_metadata_key = _resolve_audio_constant(resolve_obj, "AUDIO_SYNC_RETAIN_VIDEO_METADATA", "retainVideoMetadata")
-    mode = settings.get("syncBy", settings.get("sync_by", settings.get("mode", settings.get(mode_key))))
+    # Resolve's AutoSyncAudio only accepts its numeric enum constants as keys; a
+    # string key like "syncMode" makes it silently return False. If we can't
+    # obtain the real enum constant (constant missing on the handle), DROP the
+    # mode/channel entry rather than send a string key — AutoSyncAudio works
+    # fine with fewer/no settings, but fails outright on a bad key.
+    _SENTINEL = object()
+    mode_key = _resolve_audio_constant(resolve_obj, "AUDIO_SYNC_MODE", _SENTINEL)
+    channel_key = _resolve_audio_constant(resolve_obj, "AUDIO_SYNC_CHANNEL_NUMBER", _SENTINEL)
+    retain_embedded_key = _resolve_audio_constant(resolve_obj, "AUDIO_SYNC_RETAIN_EMBEDDED_AUDIO", _SENTINEL)
+    retain_metadata_key = _resolve_audio_constant(resolve_obj, "AUDIO_SYNC_RETAIN_VIDEO_METADATA", _SENTINEL)
+    mode = settings.get("syncBy", settings.get("sync_by", settings.get("mode")))
     if isinstance(mode, str):
         mode_norm = mode.strip().lower()
         if mode_norm in {"waveform", "audio_waveform", "audio_sync_waveform"}:
-            mode = _resolve_audio_constant(resolve_obj, "AUDIO_SYNC_WAVEFORM", mode)
+            mode = _resolve_audio_constant(resolve_obj, "AUDIO_SYNC_WAVEFORM", _SENTINEL)
         elif mode_norm in {"timecode", "audio_sync_timecode"}:
-            mode = _resolve_audio_constant(resolve_obj, "AUDIO_SYNC_TIMECODE", mode)
-    if mode is not None:
+            mode = _resolve_audio_constant(resolve_obj, "AUDIO_SYNC_TIMECODE", _SENTINEL)
+        else:
+            mode = _SENTINEL  # unknown string mode — don't pass it through
+    if mode is not None and mode is not _SENTINEL and mode_key is not _SENTINEL:
         normalized[mode_key] = mode
-    channel = settings.get("channelNumber", settings.get("channel_number", settings.get("channel", settings.get(channel_key))))
+    channel = settings.get("channelNumber", settings.get("channel_number", settings.get("channel")))
     if isinstance(channel, str):
         channel_norm = channel.strip().lower()
         if channel_norm in {"auto", "automatic"}:
             channel = _resolve_audio_constant(resolve_obj, "AUDIO_SYNC_CHANNEL_AUTOMATIC", -1)
         elif channel_norm == "mix":
             channel = _resolve_audio_constant(resolve_obj, "AUDIO_SYNC_CHANNEL_MIX", -2)
-    if channel is not None:
+        else:
+            channel = _SENTINEL
+    if channel is not None and channel is not _SENTINEL and channel_key is not _SENTINEL:
         normalized[channel_key] = channel
     for source_key, target_key in (
         ("retainEmbeddedAudio", retain_embedded_key),
@@ -5317,11 +5338,21 @@ def _normalize_auto_sync_settings(settings: Dict[str, Any], resolve_obj=None):
         ("retainVideoMetadata", retain_metadata_key),
         ("retain_video_metadata", retain_metadata_key),
     ):
-        if source_key in settings:
+        if source_key in settings and target_key is not _SENTINEL:
             normalized[target_key] = bool(settings[source_key])
+    # Pass through any other already-enum-keyed entries the caller supplied, but
+    # never forward a recognized string alias (those are handled above) — a
+    # leftover string key would make AutoSyncAudio fail.
+    known_aliases = {
+        "syncBy", "sync_by", "mode", "channelNumber", "channel_number", "channel",
+        "retainEmbeddedAudio", "retain_embedded_audio", "retainVideoMetadata", "retain_video_metadata",
+    }
     for key, value in settings.items():
-        if key not in {"syncBy", "sync_by", "mode", "channelNumber", "channel_number", "channel", "retainEmbeddedAudio", "retain_embedded_audio", "retainVideoMetadata", "retain_video_metadata"}:
-            normalized.setdefault(key, value)
+        if key in known_aliases:
+            continue
+        if isinstance(key, str):
+            continue  # unknown string keys are rejected by AutoSyncAudio — skip
+        normalized.setdefault(key, value)
     return normalized
 
 
