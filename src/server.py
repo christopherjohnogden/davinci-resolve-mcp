@@ -14327,7 +14327,11 @@ def timeline_versioning(action: str, params: Optional[Dict[str, Any]] = None) ->
 @mcp.tool()
 @_destructive_op("timeline")
 def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Timeline operations: tracks, clips, import/export, generators, titles.
+    """Timeline operations: tracks, clips, import/export, generators, titles, audio.
+
+    Includes AUDIO SYNC — use action="safe_auto_sync_audio" to auto-sync / link
+    audio to video by waveform or timecode (Resolve's "Auto Sync Audio"). Also
+    audio mapping, Fairlight probes, voice isolation, and subtitle generation.
 
     PREFER probe_* / *_capabilities / *_boundary_report / *_checked / dry_run variants
     where they exist. Raw mutators are kept for advanced callers but bypass guardrails.
