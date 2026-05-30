@@ -17,10 +17,17 @@ from src.granular import media_pool_item as mpi
 
 
 class FakeClip:
-    def __init__(self, uid, name, status="", text=""):
+    def __init__(self, uid, name, status="", text="", file_path="/m/x.mp4",
+                 transcribe_returns=True):
         self._uid = uid
         self._name = name
-        self._props = {"Transcription Status": status, "Transcription": text}
+        self._props = {
+            "Transcription Status": status,
+            "Transcription": text,
+            "File Path": file_path,
+        }
+        self._transcribe_returns = transcribe_returns
+        self.transcribe_calls = 0
 
     def GetUniqueId(self):
         return self._uid
@@ -30,6 +37,21 @@ class FakeClip:
 
     def GetClipProperty(self, key=None):
         return self._props.get(key, "")
+
+    def TranscribeAudio(self, use_speaker_detection=None):
+        self.transcribe_calls += 1
+        # Simulate async start: status flips to a pending state, not Transcribed.
+        if self._transcribe_returns:
+            self._props["Transcription Status"] = "Transcribing"
+        return self._transcribe_returns
+
+
+class FakeTimelineItem:
+    def __init__(self, media_pool_item):
+        self._mpi = media_pool_item
+
+    def GetMediaPoolItem(self):
+        return self._mpi
 
 
 class FakeSubtitleItem:
@@ -47,9 +69,10 @@ class FakeSubtitleItem:
 
 
 class FakeTimeline:
-    def __init__(self, subtitle_items=None, fps="24"):
+    def __init__(self, subtitle_items=None, fps="24", video_items=None):
         self._items = subtitle_items
         self._fps = fps
+        self._video_items = video_items or []  # list of FakeTimelineItem
         self.create_called = 0
 
     def GetSetting(self, key):
@@ -58,11 +81,15 @@ class FakeTimeline:
     def GetTrackCount(self, ttype):
         if ttype == "subtitle":
             return 1 if self._items else 0
+        if ttype == "video":
+            return 1 if self._video_items else 0
         return 0
 
     def GetItemListInTrack(self, ttype, idx):
         if ttype == "subtitle" and self._items and idx == 1:
             return list(self._items)
+        if ttype == "video" and self._video_items and idx == 1:
+            return list(self._video_items)
         return []
 
     def CreateSubtitlesFromAudio(self, settings):
@@ -195,6 +222,72 @@ class ClipTranscriptTests(unittest.TestCase):
             res = mpi.clip_transcript("get", {"clip_id": "a", "with_timecodes": True})
         self.assertIn("timeline", res["note"].lower())
         self.assertEqual(res["text"], "t")  # text always returned
+
+    # --- transcribe ---
+
+    def test_transcribe_explicit_clip_ids_starts_and_skips(self):
+        a = FakeClip("a", "A", status="")               # needs transcription
+        b = FakeClip("b", "B", status="Transcribed")    # already done -> skipped
+        with _Patch([a, b]):
+            res = mpi.clip_transcript("transcribe", {"clip_ids": ["a", "b"]})
+        self.assertEqual(res["count_started"], 1)
+        self.assertEqual(res["started"][0]["clip_id"], "a")
+        self.assertEqual(a.transcribe_calls, 1)
+        self.assertEqual(b.transcribe_calls, 0)         # skipped, not called
+        self.assertEqual(res["skipped"][0]["clip_id"], "b")
+
+    def test_transcribe_scope_mediapool(self):
+        clips = [FakeClip("a", "A", status=""), FakeClip("b", "B", status="")]
+        with _Patch(clips):
+            res = mpi.clip_transcript("transcribe", {"scope": "mediapool"})
+        self.assertEqual(res["count_started"], 2)
+
+    def test_transcribe_scope_timeline_maps_to_media_pool_items(self):
+        a = FakeClip("a", "A", status="")
+        b = FakeClip("b", "B", status="")
+        tl = FakeTimeline(video_items=[FakeTimelineItem(a), FakeTimelineItem(b),
+                                       FakeTimelineItem(a)])  # dup a
+        with _Patch([a, b], project=FakeProject(tl)):
+            res = mpi.clip_transcript("transcribe", {"scope": "timeline"})
+        # 'a' appears twice on the timeline but should be deduped.
+        self.assertEqual(res["count_started"], 2)
+        self.assertEqual(a.transcribe_calls, 1)
+
+    def test_transcribe_failure_reported(self):
+        a = FakeClip("a", "A", status="", transcribe_returns=False)
+        with _Patch([a]):
+            res = mpi.clip_transcript("transcribe", {"clip_ids": ["a"]})
+        self.assertEqual(res["count_started"], 0)
+        self.assertEqual(len(res["failed"]), 1)
+
+    def test_transcribe_no_skip_runs_all(self):
+        a = FakeClip("a", "A", status="Transcribed")
+        with _Patch([a]):
+            res = mpi.clip_transcript("transcribe", {"clip_ids": ["a"], "skip_existing": False})
+        self.assertEqual(res["count_started"], 1)
+        self.assertEqual(a.transcribe_calls, 1)
+
+    # --- status ---
+
+    def test_status_reports_per_clip(self):
+        clips = [FakeClip("a", "A", status="Transcribed"),
+                 FakeClip("b", "B", status="")]
+        with _Patch(clips):
+            res = mpi.clip_transcript("status", {"clip_ids": ["a", "b"]})
+        self.assertEqual(res["count"], 2)
+        self.assertEqual(res["transcribed"], 1)
+        self.assertFalse(res["all_done"])
+
+    def test_status_all_done(self):
+        clips = [FakeClip("a", "A", status="Transcribed")]
+        with _Patch(clips):
+            res = mpi.clip_transcript("status", {"clip_ids": ["a"]})
+        self.assertTrue(res["all_done"])
+
+    def test_unknown_scope_errors(self):
+        with _Patch([]):
+            res = mpi.clip_transcript("transcribe", {"scope": "bogus"})
+        self.assertIn("Unknown scope", res["error"])
 
 
 if __name__ == "__main__":

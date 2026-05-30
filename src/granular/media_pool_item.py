@@ -190,9 +190,11 @@ def transcribe_audio(clip_name: str, language: str = "en-US") -> str:
         return f"Error: Clip '{clip_name}' not found in Media Pool"
     
     try:
-        result = target_clip.TranscribeAudio(language)
+        # Resolve's TranscribeAudio takes an optional speaker-detection bool, not
+        # a language; language is governed by project settings. Call with no arg.
+        result = target_clip.TranscribeAudio()
         if result:
-            return f"Successfully started audio transcription for clip '{clip_name}' in language '{language}'"
+            return f"Successfully started audio transcription for clip '{clip_name}'"
         else:
             return f"Failed to start audio transcription for clip '{clip_name}'"
     except Exception as e:
@@ -959,6 +961,97 @@ def _build_transcript_payload(project, clip, *, with_timecodes: bool, wait_secon
     return payload
 
 
+def _resolve_target_clips(project, mp, p: Dict[str, Any]):
+    """Resolve a set of media-pool clips from params.
+
+    Selection (first match wins):
+      clip_ids: explicit list of media-pool clip UniqueIds
+      scope="mediapool": every media-pool clip
+      scope="timeline": clips on the current timeline, mapped to their media pool
+                        items via GetMediaPoolItem (deduped)
+      scope="folder" + folder_name: clips in a named folder (recursive)
+
+    Returns (clips, error_dict_or_None).
+    """
+    clip_ids = p.get("clip_ids")
+    if clip_ids:
+        root = mp.GetRootFolder()
+        clips = []
+        for cid in clip_ids:
+            c = _find_clip_by_id(root, cid)
+            if c:
+                clips.append(c)
+        return clips, None
+
+    scope = (p.get("scope") or "").lower()
+    if scope in ("mediapool", "media_pool", ""):
+        # Only real media (skip timelines/fusion comps) — they have a File Path.
+        clips = [c for c in get_all_media_pool_clips(mp)
+                 if _safe_clip_property(c, "File Path")]
+        return clips, None
+
+    if scope == "timeline":
+        tl = project.GetCurrentTimeline() if project else None
+        if not tl:
+            return None, {"error": "No current timeline for scope='timeline'"}
+        seen, clips = set(), []
+        for ttype in ("video", "audio"):
+            try:
+                count = tl.GetTrackCount(ttype)
+            except Exception:
+                count = 0
+            for idx in range(1, (count or 0) + 1):
+                for item in (tl.GetItemListInTrack(ttype, idx) or []):
+                    try:
+                        c = item.GetMediaPoolItem() if hasattr(item, "GetMediaPoolItem") else None
+                    except Exception:
+                        c = None
+                    if not c:
+                        continue
+                    try:
+                        uid = c.GetUniqueId()
+                    except Exception:
+                        uid = id(c)
+                    if uid in seen:
+                        continue
+                    seen.add(uid)
+                    clips.append(c)
+        return clips, None
+
+    if scope == "folder":
+        folder_name = p.get("folder_name")
+        if not folder_name:
+            return None, {"error": "folder_name is required for scope='folder'"}
+        target = None
+        if folder_name.lower() in ("root", "master"):
+            target = mp.GetRootFolder()
+        else:
+            for folder in get_all_media_pool_folders(mp):
+                if folder.GetName() == folder_name:
+                    target = folder
+                    break
+        if not target:
+            return None, {"error": f"Folder '{folder_name}' not found"}
+
+        def collect(folder):
+            out = list(folder.GetClipList() or [])
+            for sub in (folder.GetSubFolderList() or []):
+                out += collect(sub)
+            return out
+
+        clips = [c for c in collect(target) if _safe_clip_property(c, "File Path")]
+        return clips, None
+
+    return None, {"error": f"Unknown scope '{scope}'. Use mediapool, timeline, or folder."}
+
+
+def _safe_clip_property(clip, key):
+    try:
+        return clip.GetClipProperty(key) or ""
+    except Exception:
+        return ""
+
+
 @mcp.tool()
 def clip_transcript(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Read audio transcriptions from clips.
@@ -982,6 +1075,16 @@ def clip_transcript(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         -> {transcripts: [{clip_id, name, status, text, ...}], count}
         Pulls text for all transcribed clips. with_timecodes only populates
         lines for clips on the current timeline.
+      transcribe(clip_ids=[...] | scope, folder_name?, skip_existing=True,
+                 use_speaker_detection?)
+        -> {started, skipped, failed, count_started, note}
+        Starts transcription (async) on a set of clips. Target by clip_ids or
+        scope: 'mediapool' (all clips), 'timeline' (clips on current timeline,
+        mapped to media pool items), or 'folder' (+folder_name). skip_existing
+        skips already-transcribed clips. Does NOT wait — poll 'status'.
+      status(clip_ids=[...] | scope, folder_name?)
+        -> {clips: [{clip_id, name, status}], count, transcribed, all_done}
+        Transcription status for a set of clips, for polling completion.
     """
     p = params or {}
     project, mp, err = _get_mp()
@@ -1028,7 +1131,59 @@ def clip_transcript(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
             transcripts.append(entry)
         return {"transcripts": transcripts, "count": len(transcripts)}
 
-    return {"error": f"Unknown action '{action}'. Use list, get, or get_all."}
+    if action == "transcribe":
+        clips, terr = _resolve_target_clips(project, mp, p)
+        if terr:
+            return terr
+        skip_existing = bool(p.get("skip_existing", True))
+        # TranscribeAudio takes an optional speaker-detection bool (NOT language).
+        use_sd = p.get("use_speaker_detection")
+        started, skipped, failed = [], [], []
+        for clip in clips:
+            try:
+                name = clip.GetName()
+                uid = clip.GetUniqueId()
+            except Exception:
+                continue
+            if skip_existing and _transcription_status(clip) == "Transcribed":
+                skipped.append({"clip_id": uid, "name": name, "reason": "already transcribed"})
+                continue
+            try:
+                ok = clip.TranscribeAudio(use_sd) if use_sd is not None else clip.TranscribeAudio()
+            except Exception as exc:
+                failed.append({"clip_id": uid, "name": name, "error": str(exc)})
+                continue
+            (started if ok else failed).append(
+                {"clip_id": uid, "name": name} if ok
+                else {"clip_id": uid, "name": name, "error": "TranscribeAudio returned False"}
+            )
+        return {
+            "started": started,
+            "skipped": skipped,
+            "failed": failed,
+            "count_started": len(started),
+            "note": "Transcription runs asynchronously. Poll clip_transcript 'status' until clips are 'Transcribed'.",
+        }
+
+    if action == "status":
+        clips, terr = _resolve_target_clips(project, mp, p)
+        if terr:
+            return terr
+        out = []
+        for clip in clips:
+            try:
+                out.append({
+                    "clip_id": clip.GetUniqueId(),
+                    "name": clip.GetName(),
+                    "status": _transcription_status(clip),
+                })
+            except Exception:
+                continue
+        done = sum(1 for c in out if c["status"] == "Transcribed")
+        return {"clips": out, "count": len(out), "transcribed": done,
+                "all_done": done == len(out) and len(out) > 0}
+
+    return {"error": f"Unknown action '{action}'. Use list, get, get_all, transcribe, or status."}
 
 
 @mcp.tool()

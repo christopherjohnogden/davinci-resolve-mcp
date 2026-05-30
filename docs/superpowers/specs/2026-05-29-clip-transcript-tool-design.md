@@ -60,6 +60,39 @@ used by this tool; it is recorded as a possible future enhancement.
 - **Auto-transcribing** clips that aren't transcribed yet — the existing
   `transcribe_clip_audio` tool already does that.
 
+## Update (2026-05-29): transcription lifecycle actions
+
+The read tool shipped. Follow-up adds the ability to **start** transcription on a
+set of clips and **check status**, so the full loop lives in one tool:
+list → transcribe → status → get.
+
+New actions on `clip_transcript`:
+
+- `transcribe(clip_ids=[...] | scope, folder_name?, skip_existing=true, use_speaker_detection?)`
+  Starts transcription on a set of clips. Target selection:
+  - `clip_ids`: explicit list of media-pool clip IDs.
+  - `scope="mediapool"`: all media-pool clips.
+  - `scope="timeline"`: all clips on the current timeline, mapped to their media
+    pool items via `timeline_item.GetMediaPoolItem()` (verified live).
+  - `scope="folder"` + `folder_name`: a named folder, using the folder-level
+    batch `Folder.TranscribeAudio()`.
+  `skip_existing=true` (default) skips clips already `Transcribed`.
+  Async: this *starts* transcription and returns what it kicked off — it does NOT
+  wait. Returns `{started: [{clip_id, name}], skipped: [...], count_started}`.
+
+- `status(clip_ids? | scope?)`
+  Returns `{clip_id, name, status}` per targeted clip so the caller can poll for
+  completion (`status == "Transcribed"`) before calling `get`.
+
+API note: `TranscribeAudio(useSpeakerDetection=None)` takes an optional **bool**,
+NOT a language string. The existing `transcribe_folder_audio` / `transcribe_audio`
+tools pass `language="en-US"` into it — a latent bug. This work fixes those to
+pass no arg (project default) or a proper speaker-detection bool.
+
+Async behavior: transcription is real speech-to-text — slow, needs the AI model,
+and writes the result onto the clip. `transcribe` starts it; `status` is how
+completion is observed. The tool never blocks.
+
 ## Tool design
 
 Location: `src/granular/media_pool_item.py`, alongside `transcribe_clip_audio`

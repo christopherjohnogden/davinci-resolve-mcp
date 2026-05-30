@@ -92,9 +92,11 @@ def transcribe_folder_audio(folder_name: str, language: str = "en-US") -> str:
     
     # Transcribe audio in the folder
     try:
-        result = target_folder.TranscribeAudio(language)
+        # TranscribeAudio takes an optional speaker-detection bool, not a
+        # language; language is governed by project settings. Call with no arg.
+        result = target_folder.TranscribeAudio()
         if result:
-            return f"Successfully started audio transcription for folder '{folder_name}' in language '{language}'"
+            return f"Successfully started audio transcription for folder '{folder_name}'"
         else:
             return f"Failed to start audio transcription for folder '{folder_name}'"
     except Exception as e:
