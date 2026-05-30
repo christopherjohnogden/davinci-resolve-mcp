@@ -850,6 +850,17 @@ def _transcription_text(clip) -> str:
         return ""
 
 
+# Resolve's "Transcription" clip property is a preview that is cut off with a
+# trailing ellipsis for long transcripts; the full text lives in the subtitle
+# track. The ellipsis is the reliable truncation signal (the ~699-char cap is
+# undocumented and may vary by version).
+def _is_truncated(text) -> bool:
+    if not text:
+        return False
+    stripped = text.rstrip()
+    return stripped.endswith("…") or stripped.endswith("...")
+
+
 def _frames_to_tc(frame, fps) -> str:
     """Format a timeline frame number as HH:MM:SS:FF using fps (rounded)."""
     try:

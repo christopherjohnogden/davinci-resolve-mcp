@@ -290,5 +290,23 @@ class ClipTranscriptTests(unittest.TestCase):
         self.assertIn("Unknown scope", res["error"])
 
 
+class IsTruncatedTests(unittest.TestCase):
+    def test_trailing_ellipsis_glyph_is_truncated(self):
+        self.assertTrue(mpi._is_truncated("a long transcript…"))
+
+    def test_trailing_three_dots_is_truncated(self):
+        self.assertTrue(mpi._is_truncated("a long transcript..."))
+
+    def test_trailing_whitespace_after_ellipsis_still_truncated(self):
+        self.assertTrue(mpi._is_truncated("text…  \n"))
+
+    def test_normal_text_not_truncated(self):
+        self.assertFalse(mpi._is_truncated("a complete sentence."))
+
+    def test_empty_or_none_not_truncated(self):
+        self.assertFalse(mpi._is_truncated(""))
+        self.assertFalse(mpi._is_truncated(None))
+
+
 if __name__ == "__main__":
     unittest.main()
