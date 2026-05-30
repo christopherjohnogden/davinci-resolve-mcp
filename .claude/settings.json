@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venv/bin/python -c \"import ast; ast.parse\\(open\\('src/server.py'\\).read\\(\\)\\); print\\('main server.py parses OK'\\)\")",
+      "Bash(git stash *)",
+      "Bash(venv/bin/python -c ' *)"
+    ]
+  }
+}
