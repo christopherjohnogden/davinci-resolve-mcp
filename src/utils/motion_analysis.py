@@ -189,9 +189,12 @@ def parse_float(value: Any, default: float = 0.0) -> float:
 def parse_int(value: Any, default: int = 0) -> int:
     if value is None:
         return default
+    text = str(value).strip()
+    if not text:
+        return default
     try:
-        return int(round(float(str(value).strip().split()[0])))
-    except (TypeError, ValueError):
+        return int(round(float(text.split()[0])))
+    except (TypeError, ValueError, IndexError):
         return default
 
 
@@ -388,6 +391,16 @@ def _pose_frame_from_yolo(
 ) -> Dict[str, Any]:
     result_list = yolo(image, verbose=False)
     result = result_list[0] if result_list else None
+    return _pose_frame_from_result(result, true_frame=true_frame, width=width, height=height)
+
+
+def _pose_frame_from_result(
+    result: Any,
+    *,
+    true_frame: int,
+    width: int,
+    height: int,
+) -> Dict[str, Any]:
     frame: Dict[str, Any] = {"f": int(true_frame), "conf": 0.0}
     if result is None or getattr(result, "keypoints", None) is None:
         frame["low_conf"] = True

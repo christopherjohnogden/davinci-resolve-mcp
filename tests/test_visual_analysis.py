@@ -2,18 +2,24 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from src.utils.visual_analysis import (
     DEFAULT_OLLAMA_VLM_MODEL,
+    OLLAMA_VLM_JSON_SCHEMA,
     _boolish,
     _compress_camera_timeline,
     _image_to_base64_jpeg,
     _is_ollama_vlm_model,
+    _merge_vlm_metadata_rollup,
     _metadata_rollup,
+    _next_sparse_sample_frame,
     _ollama_model_name,
+    _ollama_num_ctx,
     _parse_vlm_json,
     _select_vlm_keyframes,
     _shot_size_from_box,
+    _vlm_camera_context,
     read_visual_sidecar,
     visual_sidecar_path,
 )
@@ -34,6 +40,9 @@ class VisualAnalysisTests(unittest.TestCase):
             "fps": 24,
             "duration_frames": 120,
             "sampled_every_n_frames": 5,
+            "object_sampled_every_n_frames": 120,
+            "object_sampled_every_seconds": 5.0,
+            "batch_size": 1,
             "proxy_width": 640,
             "analyzed_at": "2026-05-31T00:00:00Z",
             "tier": "fast",
@@ -56,6 +65,13 @@ class VisualAnalysisTests(unittest.TestCase):
             full = read_visual_sidecar(path, include_frames=True)
             self.assertEqual(full["frames"], [{"f": 0}])
             self.assertEqual(full["objects"]["frames"][0]["classes"], ["book"])
+            self.assertEqual(full["object_sampled_every_n_frames"], 120)
+            self.assertEqual(full["object_sampled_every_seconds"], 5.0)
+            self.assertEqual(full["batch_size"], 1)
+
+    def test_sparse_object_cadence_uses_source_frames(self):
+        self.assertEqual(_next_sparse_sample_frame(0, 24), 24)
+        self.assertEqual(_next_sparse_sample_frame(32, 24), 56)
 
     def test_shot_size_and_rollup(self):
         self.assertEqual(_shot_size_from_box([0.2, 0.1, 0.8, 0.9]), "CU")
@@ -108,6 +124,52 @@ class VisualAnalysisTests(unittest.TestCase):
         self.assertEqual(_ollama_model_name("ollama:qwen3-vl:8b"), "qwen3-vl:8b")
         self.assertEqual(_ollama_model_name("ollama/qwen3-vl:8b"), "qwen3-vl:8b")
         self.assertEqual(_ollama_model_name("ollama://qwen3-vl:8b"), "qwen3-vl:8b")
+
+    def test_ollama_num_ctx_defaults_small_for_keyframes(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(_ollama_num_ctx(), 4096)
+        with mock.patch.dict("os.environ", {"RESOLVE_MCP_OLLAMA_NUM_CTX": "2048"}):
+            self.assertEqual(_ollama_num_ctx(), 2048)
+        with mock.patch.dict("os.environ", {"RESOLVE_MCP_OLLAMA_NUM_CTX": "32"}):
+            self.assertEqual(_ollama_num_ctx(), 512)
+
+    def test_ollama_vlm_schema_rejects_extra_keys(self):
+        self.assertIn("shot_type", OLLAMA_VLM_JSON_SCHEMA["required"])
+        self.assertFalse(OLLAMA_VLM_JSON_SCHEMA["additionalProperties"])
+
+    def test_vlm_camera_context_is_compact(self):
+        context = _vlm_camera_context(
+            {
+                "timeline": [
+                    {"start": 0, "end": 50, "move": "static"},
+                    {"start": 50, "end": 100, "move": "static"},
+                    {"start": 100, "end": 200, "move": "push_in"},
+                    {"start": 500, "end": 600, "move": "pan_left"},
+                ]
+            },
+            120,
+        )
+        self.assertEqual(context["dominant_moves"][0], "static")
+        self.assertLessEqual(len(context["nearby_motion"]), 5)
+        self.assertNotIn("timeline", context)
+
+    def test_vlm_metadata_rollup_enriches_search_projection(self):
+        merged = _merge_vlm_metadata_rollup(
+            {"description": "CU; gesturing", "keywords": ["cu"], "tone": "unknown"},
+            {
+                "status": "analyzed",
+                "shot_type": "talking-head",
+                "description": "Speaker gesturing in a modern office",
+                "keyframes": [
+                    {"keywords": ["speaker", "office"], "tone": "professional"},
+                    {"keywords": ["gesture"], "tone": "professional"},
+                ],
+            },
+        )
+        self.assertEqual(merged["description"], "Speaker gesturing in a modern office")
+        self.assertEqual(merged["tone"], "professional")
+        self.assertIn("talking-head", merged["keywords"])
+        self.assertIn("office", merged["keywords"])
 
     def test_image_to_base64_jpeg_returns_ascii(self):
         from PIL import Image

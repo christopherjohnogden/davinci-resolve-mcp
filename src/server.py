@@ -12,7 +12,7 @@ Usage:
     python src/server.py --full       # Start the 330-tool granular server instead
 """
 
-VERSION = "2.30.1"
+VERSION = "2.30.8"
 
 import base64
 import os
@@ -14151,7 +14151,10 @@ def analyze_clip_visual(
     clip_id: str,
     tier: str = "fast",
     force: bool = False,
-    sample_every_n: int = 5,
+    sample_every_n: int = 10,
+    object_every_n: Optional[int] = None,
+    object_every_seconds: float = 5.0,
+    batch_size: int = 1,
     proxy_width: int = 640,
     dry_run: bool = False,
     write_metadata: bool = True,
@@ -14200,6 +14203,9 @@ def analyze_clip_visual(
             duration_frames=context["duration_frames"],
             tier=tier,
             sample_every_n=sample_every_n,
+            object_every_n=object_every_n,
+            object_every_seconds=object_every_seconds,
+            batch_size=batch_size,
             proxy_width=proxy_width,
             pose_model=pose_model,
             object_model=object_model,
@@ -14625,7 +14631,7 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
       detect_sync_events(paths?|target?, event_types?, windows?) -> {files, alignment}
       analyze_motion(clip_id, force?, sample_every_n?, proxy_width?, model?) -> cached YOLO Pose source-frame motion analysis under ~/Resolve_Analysis
       get_motion(clip_id, include_frames?) -> read cached source-frame motion events; never runs YOLO
-      analyze_clip_visual(clip_id, tier?, force?, sample_every_n?, dry_run?) -> source-safe dense visual analysis + metadata rollup
+      analyze_clip_visual(clip_id, tier?, force?, sample_every_n?, object_every_n?|object_every_seconds?, batch_size?, dry_run?) -> source-safe visual analysis + metadata rollup
       get_visual(clip_id, include_frames?) -> read cached visual sidecar; never runs analysis
       analyze_clip_transcript(clip_id, force?, model?, dry_run?, export_srt?, import_srt?) -> local Parakeet transcript sidecar + metadata/SRT projection
       get_transcript(clip_id, include_words?) -> read cached source-frame transcript; never runs transcription
@@ -14859,7 +14865,14 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
             str(clip_id),
             tier=str(p.get("tier") or "fast"),
             force=_media_analysis_bool(p.get("force"), False),
-            sample_every_n=int(p.get("sample_every_n", p.get("sampleEveryN", 5)) or 5),
+            sample_every_n=int(p.get("sample_every_n", p.get("sampleEveryN", 10)) or 10),
+            object_every_n=(
+                int(p.get("object_every_n", p.get("objectEveryN")))
+                if p.get("object_every_n", p.get("objectEveryN")) not in {None, ""}
+                else None
+            ),
+            object_every_seconds=float(p.get("object_every_seconds", p.get("objectEverySeconds", 5.0)) or 5.0),
+            batch_size=int(p.get("batch_size", p.get("batchSize", 1)) or 1),
             proxy_width=int(p.get("proxy_width", p.get("proxyWidth", 640)) or 640),
             dry_run=_media_analysis_bool(p.get("dry_run", p.get("dryRun")), False),
             write_metadata=_media_analysis_bool(p.get("write_metadata", p.get("writeMetadata")), True),

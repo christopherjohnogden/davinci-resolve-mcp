@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from src.utils.transcript_analysis import (
+    _ensure_utf8_locale_for_parakeet,
     _engine_name,
     _parakeet_lines_to_source_frames,
     frame_to_srt_timestamp,
@@ -34,6 +35,9 @@ class FakeSentence:
 
 
 class TranscriptAnalysisTests(unittest.TestCase):
+    def test_ensure_utf8_locale_for_parakeet_is_callable(self):
+        _ensure_utf8_locale_for_parakeet()
+
     def test_transcript_paths_are_project_scoped(self):
         with tempfile.TemporaryDirectory() as tmp:
             sidecar = transcript_sidecar_path("BTM/Edit:Day", "abc/123", root=tmp)

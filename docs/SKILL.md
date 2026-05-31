@@ -454,16 +454,18 @@ writing a partial sidecar. Source installs can add the optional runtime with
 
 **`analyze_clip_visual` / `get_visual`** — Source-safe dense visual sidecars.
 
-`analyze_clip_visual(clip_id, tier="fast", force=false, sample_every_n=5,
-dry_run=false)` runs one shared decode loop for pose, objects, shot size, camera
-motion, and optional expression. It writes
+`analyze_clip_visual(clip_id, tier="fast", force=false, sample_every_n=10,
+object_every_seconds=5, batch_size=1, dry_run=false)` runs one shared decode loop
+for pose, sparse objects, shot size, camera motion, and optional expression. It writes
 `~/Resolve_Analysis/<project>/<media_id>_visual.json` and writes a compact
 projection to standard Resolve metadata fields (`Description`, `Comments`,
 `Keywords`, `Shot`) unless `dry_run=true` or `write_metadata=false`.
 `get_visual(clip_id, include_frames=false)` is pure read for edit decisions.
 `tier="deep"` is opt-in VLM enrichment and defaults to
 `vlm_model="ollama:qwen3-vl:8b"`. Pass a different local Ollama model or a local
-Transformers Qwen model path/id when needed.
+Transformers Qwen model path/id when needed. Ollama VLM calls cap context with
+`RESOLVE_MCP_OLLAMA_NUM_CTX` (default `4096`) so single-keyframe analysis does not
+inherit huge model defaults.
 Fast tier is the default production path.
 
 **`analyze_clip_transcript` / `get_transcript`** — Local Parakeet transcript sidecars.

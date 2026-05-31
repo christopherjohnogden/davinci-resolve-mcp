@@ -7,6 +7,7 @@ from src.utils.motion_analysis import (
     build_pose_pointer,
     extract_motion_events,
     motion_sidecar_path,
+    parse_int,
     read_motion_sidecar,
     summarize_motion_events,
     write_json_atomic,
@@ -32,6 +33,12 @@ def _frame(f, *, wrist_y=0.70, nose_x=0.50, energy=None):
 
 
 class MotionAnalysisTests(unittest.TestCase):
+    def test_parse_int_handles_blank_resolve_properties(self):
+        self.assertEqual(parse_int("", 7), 7)
+        self.assertEqual(parse_int("   ", 7), 7)
+        self.assertEqual(parse_int(None, 7), 7)
+        self.assertEqual(parse_int("123 frames", 0), 123)
+
     def test_sidecar_path_and_pointer_use_project_and_media_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = motion_sidecar_path("BTM/Edit:Day", "abc/123", root=tmp)

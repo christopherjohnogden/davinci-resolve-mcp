@@ -8,6 +8,7 @@ source of truth for edit decisions; SRT and Resolve metadata are projections.
 from __future__ import annotations
 
 import json
+import locale
 import math
 import os
 import re
@@ -28,6 +29,7 @@ DEFAULT_PARAKEET_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
 DEFAULT_TRANSCRIPT_ENGINE = "parakeet-tdt-0.6b-v3"
 TRANSCRIPT_METADATA_FIELDS = ("Description", "Comments", "Keywords")
 _PARAKEET_CACHE: Dict[Tuple[str, str, Optional[str], bool, int], Any] = {}
+_UTF8_LOCALE_CANDIDATES = ("", "C.UTF-8", "en_US.UTF-8", "UTF-8")
 _KEYWORD_STOPWORDS = {
     "about",
     "after",
@@ -178,6 +180,7 @@ def _load_parakeet_model(
     local_attention: bool,
     local_attention_context_size: int,
 ):
+    _ensure_utf8_locale_for_parakeet()
     try:
         import mlx.core as mx  # type: ignore
         from parakeet_mlx import from_pretrained  # type: ignore
@@ -197,6 +200,27 @@ def _load_parakeet_model(
             )
         _PARAKEET_CACHE[key] = loaded
     return _PARAKEET_CACHE[key], dtype
+
+
+def _ensure_utf8_locale_for_parakeet() -> None:
+    """Keep Parakeet's third-party config reads on a UTF-8 locale.
+
+    Resolve's scripting library can reset LC_CTYPE to C inside the MCP process.
+    parakeet-mlx opens Hugging Face config JSON without an explicit encoding,
+    so that C/ASCII locale can make model loading fail before transcription.
+    """
+    try:
+        if "utf" in locale.getpreferredencoding(False).lower():
+            return
+    except Exception:
+        pass
+    for candidate in _UTF8_LOCALE_CANDIDATES:
+        try:
+            locale.setlocale(locale.LC_CTYPE, candidate)
+            if "utf" in locale.getpreferredencoding(False).lower():
+                return
+        except Exception:
+            continue
 
 
 def _engine_name(model: str) -> str:

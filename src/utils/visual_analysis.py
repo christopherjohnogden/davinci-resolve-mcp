@@ -22,7 +22,7 @@ from urllib import request as urlrequest
 
 from src.utils.motion_analysis import (
     _frame_chunks,
-    _pose_frame_from_yolo,
+    _pose_frame_from_result,
     add_motion_energy,
     extract_motion_events,
     ffprobe_video_info,
@@ -40,6 +40,19 @@ from src.utils.motion_analysis import (
 VISUAL_SCHEMA_VERSION = 1
 VISUAL_METADATA_FIELDS = ("Description", "Comments", "Keywords", "Shot")
 DEFAULT_OLLAMA_VLM_MODEL = "ollama:qwen3-vl:8b"
+OLLAMA_VLM_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "shot_type": {"type": "string"},
+        "description": {"type": "string"},
+        "story_beat": {"type": "boolean"},
+        "story_note": {"type": "string"},
+        "keywords": {"type": "array", "items": {"type": "string"}},
+        "tone": {"type": "string"},
+    },
+    "required": ["shot_type", "description", "story_beat", "story_note", "keywords", "tone"],
+    "additionalProperties": False,
+}
 _OBJECT_IGNORE = {"person"}
 _VLM_CACHE: Dict[str, Any] = {}
 
@@ -71,6 +84,9 @@ def read_visual_sidecar(path: Path, include_frames: bool = False) -> Optional[Di
         "fps": payload.get("fps"),
         "duration_frames": payload.get("duration_frames"),
         "sampled_every_n_frames": payload.get("sampled_every_n_frames"),
+        "object_sampled_every_n_frames": payload.get("object_sampled_every_n_frames"),
+        "object_sampled_every_seconds": payload.get("object_sampled_every_seconds"),
+        "batch_size": payload.get("batch_size"),
         "proxy_width": payload.get("proxy_width"),
         "analyzed_at": payload.get("analyzed_at"),
         "tier": payload.get("tier"),
@@ -103,7 +119,10 @@ def run_clip_visual_analysis(
     fps: float,
     duration_frames: int,
     tier: str = "fast",
-    sample_every_n: int = 5,
+    sample_every_n: int = 10,
+    object_every_n: Optional[int] = None,
+    object_every_seconds: float = 5.0,
+    batch_size: int = 1,
     proxy_width: int = 640,
     pose_model: str = "yolo11n-pose",
     object_model: str = "yolo11n",
@@ -119,7 +138,9 @@ def run_clip_visual_analysis(
         raise RuntimeError("tier must be 'fast' or 'deep'")
     if tier == "deep" and not vlm_model:
         vlm_model = DEFAULT_OLLAMA_VLM_MODEL
-    sample_every_n = max(1, int(sample_every_n or 5))
+    sample_every_n = max(1, int(sample_every_n or 10))
+    object_every_seconds = max(0.1, float(object_every_seconds or 5.0))
+    batch_size = max(1, int(batch_size or 1))
     expression_every_n = max(1, int(expression_every_n or 2))
 
     try:
@@ -138,6 +159,10 @@ def run_clip_visual_analysis(
         fps = float(probe.get("fps") or 0.0)
     if not duration_frames:
         duration_frames = int(probe.get("duration_frames") or 0)
+    if object_every_n is None or int(object_every_n or 0) <= 0:
+        object_every_n = max(sample_every_n, int(round(float(fps or 24.0) * object_every_seconds)))
+    else:
+        object_every_n = max(1, int(object_every_n))
     width, height = proxy_dimensions(source_width, source_height, proxy_width)
     frame_bytes = width * height * 3
 
@@ -175,24 +200,43 @@ def run_clip_visual_analysis(
     prev_f: Optional[int] = None
 
     proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        for sample_index, chunk in enumerate(_frame_chunks(proc, frame_bytes)):
-            f = sample_index * sample_every_n
-            image = np.frombuffer(chunk, dtype=np.uint8).reshape((height, width, 3))
-            pose_frame = _pose_frame_from_yolo(
-                yolo=pose_yolo,
-                image=image,
+    next_object_f = 0
+
+    def process_batch(batch: List[Tuple[int, Any]]) -> None:
+        nonlocal next_object_f, prev_gray, prev_f
+        if not batch:
+            return
+        images = [image for _, image in batch]
+        pose_results = pose_yolo(images, verbose=False)
+        object_indices: List[int] = []
+        for index, (f, _) in enumerate(batch):
+            if f >= next_object_f:
+                object_indices.append(index)
+                next_object_f = _next_sparse_sample_frame(f, object_every_n)
+        object_results = object_yolo([batch[index][1] for index in object_indices], verbose=False) if object_indices else []
+        object_result_by_index = {
+            index: object_results[offset] if offset < len(object_results) else None
+            for offset, index in enumerate(object_indices)
+        }
+
+        for index, (f, image) in enumerate(batch):
+            pose_result = pose_results[index] if index < len(pose_results) else None
+            pose_frame = _pose_frame_from_result(
+                pose_result,
                 true_frame=f,
                 width=width,
                 height=height,
             )
             pose_frames.append(pose_frame)
 
-            detection = _detect_objects(object_yolo, image, f, width, height)
-            object_frames.append({"f": f, "objects": detection["objects"]})
+            detection = {"objects": [], "person_boxes": []}
+            if index in object_result_by_index:
+                detection = _detect_objects_from_result(object_result_by_index.get(index), width, height)
+                object_frames.append({"f": f, "objects": detection["objects"]})
             person_box = _best_person_box(detection["person_boxes"], pose_frame.get("person_box"))
             shot_frames.append({"f": f, "size": _shot_size_from_box(person_box), "person_box": person_box})
 
+            sample_index = f // sample_every_n
             if expression_model is not None and sample_index % expression_every_n == 0:
                 expression_frames.append(_expression_frame(expression_model, image, f, person_box))
 
@@ -201,6 +245,17 @@ def run_clip_visual_analysis(
                 camera_intervals.append(_camera_interval(cv2, prev_gray, gray, prev_f, f))
             prev_gray = gray
             prev_f = f
+
+    try:
+        batch: List[Tuple[int, Any]] = []
+        for sample_index, chunk in enumerate(_frame_chunks(proc, frame_bytes)):
+            f = sample_index * sample_every_n
+            image = np.frombuffer(chunk, dtype=np.uint8).reshape((height, width, 3))
+            batch.append((f, image))
+            if len(batch) >= batch_size:
+                process_batch(batch)
+                batch = []
+        process_batch(batch)
 
         stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
         returncode = proc.wait(timeout=30)
@@ -238,6 +293,7 @@ def run_clip_visual_analysis(
         rollup=metadata_rollup,
         max_keyframes=vlm_max_keyframes,
     )
+    metadata_rollup = _merge_vlm_metadata_rollup(metadata_rollup, vlm)
     analyzed_at = utc_now_iso()
 
     return {
@@ -248,6 +304,9 @@ def run_clip_visual_analysis(
         "fps": fps,
         "duration_frames": duration_frames,
         "sampled_every_n_frames": sample_every_n,
+        "object_sampled_every_n_frames": object_every_n,
+        "object_sampled_every_seconds": object_every_seconds,
+        "batch_size": batch_size,
         "proxy_width": width,
         "analyzed_at": analyzed_at,
         "tier": tier,
@@ -277,9 +336,17 @@ def run_clip_visual_analysis(
     }
 
 
+def _next_sparse_sample_frame(current_frame: int, every_n: int) -> int:
+    return int(current_frame) + max(1, int(every_n or 1))
+
+
 def _detect_objects(yolo: Any, image: Any, f: int, width: int, height: int) -> Dict[str, Any]:
     result_list = yolo(image, verbose=False)
     result = result_list[0] if result_list else None
+    return _detect_objects_from_result(result, width, height)
+
+
+def _detect_objects_from_result(result: Any, width: int, height: int) -> Dict[str, Any]:
     objects: List[Dict[str, Any]] = []
     person_boxes: List[List[float]] = []
     if result is None or getattr(result, "boxes", None) is None:
@@ -546,6 +613,31 @@ def _metadata_rollup(
         "keywords": sorted({kw for kw in keywords if kw and kw != "unknown"}),
         "tone": tone_value,
     }
+
+
+def _merge_vlm_metadata_rollup(rollup: Dict[str, Any], vlm: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(vlm, dict) or vlm.get("status") != "analyzed":
+        return rollup
+    merged = dict(rollup)
+    description = str(vlm.get("description") or "").strip()
+    if description:
+        merged["description"] = description
+    shot_type = str(vlm.get("shot_type") or "").strip()
+    if shot_type:
+        merged["shot_type"] = shot_type
+    keywords = list(merged.get("keywords") or [])
+    if shot_type:
+        keywords.append(shot_type)
+    tones = []
+    for keyframe in vlm.get("keyframes") or []:
+        keywords.extend(str(keyword) for keyword in (keyframe.get("keywords") or []) if keyword)
+        tone = str(keyframe.get("tone") or "").strip()
+        if tone and tone != "unknown":
+            tones.append(tone)
+    if tones:
+        merged["tone"] = Counter(tones).most_common(1)[0][0]
+    merged["keywords"] = sorted({keyword for keyword in keywords if keyword and keyword != "unknown"})
+    return merged
 
 
 def _run_deep_vlm(
@@ -824,6 +916,13 @@ def _ollama_host() -> str:
     return host.rstrip("/")
 
 
+def _ollama_num_ctx() -> int:
+    try:
+        return max(512, int(os.environ.get("RESOLVE_MCP_OLLAMA_NUM_CTX", "4096") or 4096))
+    except Exception:
+        return 4096
+
+
 def _image_to_base64_jpeg(image: Any) -> str:
     buffer = io.BytesIO()
     if getattr(image, "mode", "RGB") != "RGB":
@@ -841,9 +940,10 @@ def _generate_ollama_response(model_name: str, image: Any, prompt: str) -> str:
         "prompt": prompt,
         "images": [_image_to_base64_jpeg(image)],
         "stream": False,
-        "format": "json",
+        "format": OLLAMA_VLM_JSON_SCHEMA,
         "options": {
             "temperature": 0,
+            "num_ctx": _ollama_num_ctx(),
             "num_predict": 220,
         },
     }
@@ -865,16 +965,47 @@ def _generate_ollama_response(model_name: str, image: Any, prompt: str) -> str:
 
 def _vlm_prompt(frame: int, fps: float, rollup: Dict[str, Any], camera: Dict[str, Any]) -> str:
     seconds = round(frame / fps, 2) if fps else None
+    camera_context = _vlm_camera_context(camera, frame)
     return (
         "You are providing visual judgment for a film editor. "
         "Analyze this single keyframe in the context of the dense CV signals. "
-        "Return JSON only with keys: shot_type, description, story_beat, story_note, keywords, tone. "
-        "story_beat must be a JSON boolean, not prose. "
+        "Return exactly one JSON object with only these keys: shot_type, description, "
+        "story_beat, story_note, keywords, tone. Do not return start, end, frame, or time keys. "
+        "story_beat must be a JSON boolean, not prose. keywords must be short searchable tags. "
         "Use concise editorial language. story_beat must be true only if the frame looks like a strong "
-        "delivery, reaction, gesture peak, or useful cutaway.\n"
+        "delivery, reaction, gesture peak, or useful cutaway. Do not copy keys from the dense_rollup or "
+        "camera_context; use those only as context for judging the image.\n"
         f"Frame: {frame}; seconds: {seconds}; dense_rollup: {json.dumps(rollup, sort_keys=True)}; "
-        f"camera_timeline: {json.dumps(camera.get('timeline') or [], sort_keys=True)}"
+        f"camera_context: {json.dumps(camera_context, sort_keys=True)}"
     )
+
+
+def _vlm_camera_context(camera: Dict[str, Any], frame: int) -> Dict[str, Any]:
+    timeline = camera.get("timeline") or []
+    moves = [str(segment.get("move") or "") for segment in timeline if segment.get("move")]
+    nearby: List[Dict[str, Any]] = []
+    try:
+        target = int(frame)
+    except Exception:
+        target = 0
+    for segment in timeline:
+        try:
+            start = int(segment.get("start") or 0)
+            end = int(segment.get("end") if segment.get("end") is not None else start)
+        except Exception:
+            continue
+        if start <= target <= end or min(abs(target - start), abs(target - end)) <= 120:
+            nearby.append({
+                "move": segment.get("move"),
+                "from": start,
+                "to": end,
+            })
+        if len(nearby) >= 5:
+            break
+    return {
+        "dominant_moves": [move for move, _ in Counter(moves).most_common(3)],
+        "nearby_motion": nearby,
+    }
 
 
 def _boolish(value: Any) -> bool:
