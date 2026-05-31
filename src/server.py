@@ -12,7 +12,7 @@ Usage:
     python src/server.py --full       # Start the 330-tool granular server instead
 """
 
-VERSION = "2.30.8"
+VERSION = "2.30.9"
 
 import base64
 import os

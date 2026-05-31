@@ -1,6 +1,6 @@
 # DaVinci Resolve MCP Server
 
-[![Version](https://img.shields.io/badge/version-2.30.8-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
+[![Version](https://img.shields.io/badge/version-2.30.9-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
 [![npm](https://img.shields.io/npm/v/davinci-resolve-mcp.svg?label=npm&color=CB3837)](https://www.npmjs.com/package/davinci-resolve-mcp)
 [![API Coverage](https://img.shields.io/badge/API%20Coverage-100%25-brightgreen.svg)](docs/reference/api-coverage.md)
 [![Tools](https://img.shields.io/badge/MCP%20Tools-40%20(330%20full)-blue.svg)](#server-modes)
@@ -140,6 +140,7 @@ Extension authoring references live in [docs/authoring](docs/authoring/). Resolv
 - Resolve external scripting set to **Local**.
 - Optional for `analyze_motion` / `analyze_clip_visual`: FFmpeg/FFprobe plus `numpy`, `opencv-python`, `ultralytics`, and optional expression/VLM packages in the MCP Python environment. Deep visual analysis defaults to Ollama via `vlm_model="ollama:qwen3-vl:8b"` and can also use a local Transformers Qwen model path/id.
 - `analyze_clip_visual` defaults to pose every 10 source frames and objects about every 5 seconds so editorial motion stays useful while object/search tags run sparsely. The `batch_size` knob remains available, but defaults to 1 because that benchmarked faster on the current Mac/Ultralytics path. Ollama deep VLM calls cap context with `RESOLVE_MCP_OLLAMA_NUM_CTX` (default `4096`) so single-keyframe analysis does not inherit huge model defaults.
+- Deep VLM keyframes are evenly distributed across the full source duration; each time bucket picks the strongest local action/expression frame when available.
 - Optional for `analyze_clip_transcript`: `parakeet-mlx` in the MCP Python environment. It writes transcript sidecars, metadata projections, and per-clip SRTs; it does not inject external transcripts into Resolve's native Audio Transcription panel.
 
 Resolve 19.1.3 remains the compatibility baseline. Resolve 20.x scripting calls are additive, version-guarded, and live-tested on 20.3.2. Resolve 21 beta APIs are intentionally deferred until stable.

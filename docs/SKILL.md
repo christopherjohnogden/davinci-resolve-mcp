@@ -465,7 +465,9 @@ projection to standard Resolve metadata fields (`Description`, `Comments`,
 `vlm_model="ollama:qwen3-vl:8b"`. Pass a different local Ollama model or a local
 Transformers Qwen model path/id when needed. Ollama VLM calls cap context with
 `RESOLVE_MCP_OLLAMA_NUM_CTX` (default `4096`) so single-keyframe analysis does not
-inherit huge model defaults.
+inherit huge model defaults. `vlm_max_keyframes` is distributed across the full
+source duration, with each time bucket preferring its strongest local
+action/expression frame.
 Fast tier is the default production path.
 
 **`analyze_clip_transcript` / `get_transcript`** — Local Parakeet transcript sidecars.

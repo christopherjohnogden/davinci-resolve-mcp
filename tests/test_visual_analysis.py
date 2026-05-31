@@ -111,6 +111,19 @@ class VisualAnalysisTests(unittest.TestCase):
         self.assertIn(150, frames)
         self.assertLessEqual(len(frames), 4)
 
+    def test_deep_keyframe_selection_spreads_across_duration(self):
+        frames = _select_vlm_keyframes(
+            duration_frames=1200,
+            sample_every_n=10,
+            pose_events=[{"peak": 20}, {"peak": 40}, {"peak": 60}, {"peak": 80}],
+            expression_events=[],
+            camera={"timeline": []},
+            max_keyframes=4,
+        )
+        self.assertEqual(len(frames), 4)
+        self.assertLess(frames[0], 300)
+        self.assertGreaterEqual(frames[-1], 1000)
+
     def test_parse_vlm_json_extracts_embedded_json(self):
         parsed = _parse_vlm_json('Here: {"shot_type":"static","story_beat":true,"keywords":["podium"]}')
         self.assertEqual(parsed["shot_type"], "static")

@@ -720,6 +720,9 @@ def _select_vlm_keyframes(
 ) -> List[int]:
     max_keyframes = max(1, int(max_keyframes or 12))
     frame_limit = max(0, int(duration_frames or 0) - 1)
+    if frame_limit <= 0:
+        return [0]
+    bucket_count = min(max_keyframes, frame_limit + 1)
     candidates: List[Tuple[int, int]] = []
 
     def add(priority: int, value: Any) -> None:
@@ -733,14 +736,10 @@ def _select_vlm_keyframes(
             frame = min(frame, frame_limit)
         candidates.append((priority, frame))
 
-    if frame_limit:
-        add(5, 0)
-        add(5, frame_limit // 2)
-        add(5, frame_limit)
-    else:
-        add(5, 0)
     for event in pose_events:
-        add(0, event.get("peak") if event.get("peak") is not None else event.get("start"))
+        event_type = str(event.get("type") or "")
+        priority = 3 if event_type == "still" else 0
+        add(priority, event.get("peak") if event.get("peak") is not None else event.get("start"))
     for event in expression_events:
         add(1, event.get("peak") if event.get("peak") is not None else event.get("start"))
     for segment in camera.get("timeline") or []:
@@ -748,7 +747,39 @@ def _select_vlm_keyframes(
         if segment.get("start") is not None and segment.get("end") is not None:
             add(3, (int(segment["start"]) + int(segment["end"])) // 2)
 
-    min_gap = max(1, int(sample_every_n or 5) * 3)
+    selected: List[int] = []
+    used = set()
+    bucket_ranges: List[Tuple[int, int, int]] = []
+    for index in range(bucket_count):
+        start = int(round(index * (frame_limit + 1) / bucket_count))
+        end = int(round((index + 1) * (frame_limit + 1) / bucket_count)) - 1
+        end = min(frame_limit, max(start, end))
+        center = min(frame_limit, max(0, (start + end) // 2))
+        bucket_ranges.append((start, end, center))
+
+    for start, end, center in bucket_ranges:
+        bucket_candidates = [
+            (priority, abs(frame - center), frame)
+            for priority, frame in candidates
+            if start <= frame <= end and frame not in used
+        ]
+        if bucket_candidates:
+            _, _, frame = sorted(bucket_candidates)[0]
+        else:
+            frame = center
+        selected.append(frame)
+        used.add(frame)
+
+    if len(selected) < bucket_count:
+        for _, _, center in bucket_ranges:
+            if center in used:
+                continue
+            selected.append(center)
+            used.add(center)
+            if len(selected) >= bucket_count:
+                break
+
+    return sorted(selected[:bucket_count] or [0])
     selected: List[int] = []
     for _, frame in sorted(candidates, key=lambda item: (item[0], item[1])):
         if any(abs(frame - existing) < min_gap for existing in selected):
