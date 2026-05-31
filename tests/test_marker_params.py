@@ -2,6 +2,7 @@ import unittest
 
 import src.server as compound
 from tests._error_envelope_helpers import err_message
+from src.utils import destructive_hook
 
 
 def _strip_versioning(d):
@@ -52,11 +53,14 @@ class FiveArgMarkerStub:
 class TimelineMarkerParamTest(unittest.TestCase):
     def setUp(self):
         self.original_get_tl = compound._get_tl
+        self.original_destructive_provider = destructive_hook._PROVIDER
         self.timeline = TimelineStub()
         compound._get_tl = lambda: (None, self.timeline, None)
+        destructive_hook.register_project_root_provider(lambda: None)
 
     def tearDown(self):
         compound._get_tl = self.original_get_tl
+        destructive_hook._PROVIDER = self.original_destructive_provider
 
     def test_add_accepts_frame_id_alias_and_defaults_name_duration(self):
         out = compound.timeline_markers(

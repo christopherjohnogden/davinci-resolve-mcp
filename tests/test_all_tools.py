@@ -8,6 +8,10 @@ Requires DaVinci Resolve to be running with a project open and at least
 one timeline with at least one clip.
 """
 
+if __name__ != "__main__":
+    import unittest
+    raise unittest.SkipTest("live Resolve API validation script; run directly")
+
 import sys
 import os
 import json

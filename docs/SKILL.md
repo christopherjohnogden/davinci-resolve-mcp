@@ -100,8 +100,8 @@ before mutating Resolve state.
 
 | Mode | Entry point | Tool count | Use when |
 |---|---|---|---|
-| Compound (default) | `src/server.py` | 32 tools | Most workflows — keeps context lean |
-| Granular (full) | `src/server.py --full` | 329 tools | Power users needing one tool per API method |
+| Compound (default) | `src/server.py` | 34 tools | Most workflows — keeps context lean |
+| Granular (full) | `src/server.py --full` | 330 tools | Power users needing one tool per API method |
 
 This skill document covers the **compound server** (the default). Each compound
 tool accepts an `action` string and an optional `params` object.
@@ -447,14 +447,17 @@ report reuse, persisted analysis execution, host_chat_paths visual review
 (finalized per clip via `commit_vision`), transcription, default Resolve
 metadata/marker writeback, and timeline-level editorial helpers.
 
-Key actions: `capabilities`, `install_guidance`, `resolve_output_root`, `plan`,
+Key actions: `capabilities`, `get_caps`, `get_usage`, `install_guidance`,
+`resolve_output_root`, `plan`,
 `coverage_report`, `analyze_file`, `analyze_clip`, `analyze_bin`,
 `analyze_project`, `detect_sync_events`, `add_sync_event_markers`,
 `publish_clip_metadata`, `commit_vision`, `summarize`, `get_report`,
 `build_index`, `index_status`, `query_index`, `start_batch_job`,
 `run_batch_job_slice`, `batch_job_status`, `list_batch_jobs`,
-`cancel_batch_job`, `resume_batch_job`, `review_timeline_markers`, and
-`cleanup_artifacts`.
+`cancel_batch_job`, `resume_batch_job`, `review_timeline_markers`,
+`get_panel_state`, `set_panel_state`, `session_start_context`,
+`update_shot_field`, `update_clip_field`, `get_field_history`, `revert_field`,
+`list_corrections`, and `cleanup_artifacts`.
 The tool never installs
 dependencies and validates that outputs stay under
 `davinci-resolve-mcp-analysis` project roots rather than beside source media.
@@ -702,7 +705,9 @@ Key actions:
   a guarded timeline variant from declarative source ranges, optional markers,
   transforms, and CDL
 - `bulk_set_item_properties(ops, dry_run?, readback?)` — apply transforms,
-  crop/composite/audio/property groups to many timeline items in one call
+  crop/composite/audio/property groups, clip color, and clip-level
+  `enabled`/`disabled` state to many timeline items in one call. Clip enabled
+  state uses `TimelineItem.SetClipEnabled()`, not track enable.
 - `apply_look_to_items(target_ids, cdl?|copy_from_item_id?, dry_run?)` — apply a
   normalized CDL and/or copy a source grade to multiple video items
 - `thumbnail_contact_sheet` / `marker_thumbnail_review` — sample Resolve-rendered
@@ -753,6 +758,15 @@ helpers:
 - `audio_mix_capability_report(...)`
 - `voice_isolation_capabilities(track_index?, track_type?, item_index?)`
 - `audio_mapping_report(clip_ids?)`
+- `sync_media_pool_audio(settings?, dry_run?, scope?, recursive?)`
+  - Preferred for prompts like "sync all audio to videos in the media pool".
+    This is the deterministic ResolveChat-style path: collect Media Pool camera
+    and audio clips recursively, batch one camera at a time, and report Resolve
+    readback. Default is waveform, `dry_run=false`, `scope="root"`,
+    `recursive=true`.
+  - Do not switch to timecode or pair-isolation unless the user explicitly asks.
+    Do not infer failure from source timecode ranges; trust `linked`,
+    `Synced Audio`, `Sound Roll #`, and `Audio Offset`.
 - `safe_auto_sync_audio(clip_ids|selected, settings?, dry_run?)`
   - For multiple camera clips and candidate lav/audio files, pass all intended
     clip IDs together; the compound server batches one camera at a time against

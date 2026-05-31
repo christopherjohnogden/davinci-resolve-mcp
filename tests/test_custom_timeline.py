@@ -13,6 +13,10 @@ Requirements:
     - requests module (pip install requests)
 """
 
+if __name__ != "__main__":
+    import unittest
+    raise unittest.SkipTest("external MCP HTTP validation script; run directly")
+
 import sys
 import time
 import requests
@@ -134,4 +138,4 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    main() 
+    main()

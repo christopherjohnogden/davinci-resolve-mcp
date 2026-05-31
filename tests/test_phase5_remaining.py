@@ -9,6 +9,11 @@ Tests:
   - Graph.GetToolsInNode
   - Graph.SetNodeEnabled
 """
+
+if __name__ != "__main__":
+    import unittest
+    raise unittest.SkipTest("live Resolve API phase validation script; run directly")
+
 import sys, os, json, time
 
 sys.path.append("/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules")

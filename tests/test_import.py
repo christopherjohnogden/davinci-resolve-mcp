@@ -97,7 +97,7 @@ def test_utils_syntax():
 
 
 def test_compound_tool_count():
-    assert _count_mcp_tools(PROJECT_ROOT / "src" / "server.py") == 33
+    assert _count_mcp_tools(PROJECT_ROOT / "src" / "server.py") == 34
 
 
 def test_prompt_registrations():

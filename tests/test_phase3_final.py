@@ -8,6 +8,10 @@ Run with: python3 tests/test_phase3_final.py
 Requires DaVinci Resolve Studio running.
 """
 
+if __name__ != "__main__":
+    import unittest
+    raise unittest.SkipTest("live Resolve API phase validation script; run directly")
+
 import sys
 import os
 import json

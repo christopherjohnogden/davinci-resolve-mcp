@@ -9,6 +9,11 @@ Tests:
   - TL.ConvertTimelineToStereo
   - Gallery still operations (GSA.SetLabel, ExportStills, ImportStills, DeleteStills)
 """
+
+if __name__ != "__main__":
+    import unittest
+    raise unittest.SkipTest("live Resolve API phase validation script; run directly")
+
 import sys, os, json, time, tempfile
 
 sys.path.insert(0, "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules")

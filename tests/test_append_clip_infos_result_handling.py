@@ -3,17 +3,21 @@ import unittest
 from src.server import (
     _append_clip_info_from_timeline_item,
     _collect_timeline_items_in_range,
+    _coerce_bool_value,
     _copy_duplicate_item_state,
     _copy_keyframes,
     _timeline_edit_kernel_capabilities,
+    _timeline_bulk_set_item_properties,
     _timeline_item_probe,
     _find_next_gap_record_frame,
     _find_appended_timeline_item_summary,
     _get_selected_timeline_items,
     _normalize_include_linked,
     _normalize_copy_properties,
+    _param_bool,
     _resolve_duplicate_record_frame,
     _resolve_duplicate_track_index,
+    _serialize_append_clip_infos_result,
     _serialize_appended_timeline_item,
 )
 
@@ -156,6 +160,28 @@ class TimelineRangeStub:
         return []
 
 
+class BulkSetTimelineStub:
+    def __init__(self, video_items=None, audio_items=None):
+        self.video_items = video_items or []
+        self.audio_items = audio_items or []
+
+    def GetTrackCount(self, track_type):
+        if track_type == "video":
+            return 1 if self.video_items else 0
+        if track_type == "audio":
+            return 1 if self.audio_items else 0
+        return 0
+
+    def GetItemListInTrack(self, track_type, track_index):
+        if track_index != 1:
+            return []
+        if track_type == "video":
+            return self.video_items
+        if track_type == "audio":
+            return self.audio_items
+        return []
+
+
 class SelectedTimelineStub:
     def __init__(self, selected=None, current=None):
         self.selected = selected or []
@@ -215,6 +241,7 @@ class PropertyCopyItemStub:
         self.added_markers = []
         self.flags = ["Blue", "Green"]
         self.added_flags = []
+        self.set_property_calls = []
         self.color_cache = "On"
         self.fusion_cache = "Auto"
         self.voice_state = {"isEnabled": True, "amount": 33}
@@ -258,6 +285,7 @@ class PropertyCopyItemStub:
         return self.properties.get(key)
 
     def SetProperty(self, key, value):
+        self.set_property_calls.append((key, value))
         self.properties[key] = value
         return True
 
@@ -469,6 +497,55 @@ class AppendClipInfosResultHandlingTest(unittest.TestCase):
 
         self.assertEqual(summary, {"timeline_item_id": "audio-item-new", "name": "duplicate.mov"})
 
+    def test_serialize_append_clip_infos_result_recovers_audio_id_from_timeline(self):
+        mpi = MediaPoolItemWithIdStub("media-1")
+        thin_return = TimelineItemStub(unique_id="", name="thin-audio-return")
+        real_audio = AppendedTimelineItemStub(mpi, unique_id="audio-item-new", start=105, end=165)
+        built = [{
+            "mediaPoolItem": mpi,
+            "startFrame": 24,
+            "endFrame": 84,
+            "recordFrame": 105,
+            "trackIndex": 2,
+            "mediaType": 2,
+        }]
+
+        items, err, warnings = _serialize_append_clip_infos_result(
+            TimelineWithTrackStub([real_audio]),
+            built,
+            [thin_return],
+        )
+
+        self.assertIsNone(err)
+        self.assertEqual(warnings, [])
+        self.assertEqual(items[0]["timeline_item_id"], "audio-item-new")
+        self.assertTrue(items[0]["recovered_from_timeline_scan"])
+
+    def test_serialize_append_clip_infos_result_marks_already_present_match(self):
+        mpi = MediaPoolItemWithIdStub("media-1")
+        thin_return = TimelineItemStub(unique_id="", name="thin-audio-return")
+        real_audio = AppendedTimelineItemStub(mpi, unique_id="audio-item-existing", start=105, end=165)
+        built = [{
+            "mediaPoolItem": mpi,
+            "startFrame": 24,
+            "endFrame": 84,
+            "recordFrame": 105,
+            "trackIndex": 2,
+            "mediaType": 2,
+        }]
+
+        items, err, warnings = _serialize_append_clip_infos_result(
+            TimelineWithTrackStub([real_audio]),
+            built,
+            [thin_return],
+            before_summaries=[{"timeline_item_id": "audio-item-existing", "name": "duplicate.mov"}],
+        )
+
+        self.assertIsNone(err)
+        self.assertEqual(warnings, [])
+        self.assertEqual(items[0]["timeline_item_id"], "audio-item-existing")
+        self.assertTrue(items[0]["already_present_before_append"])
+
     def test_resolve_duplicate_track_index_supports_track_above_default(self):
         dest, err = _resolve_duplicate_track_index(1, "track_above", {})
 
@@ -637,6 +714,52 @@ class AppendClipInfosResultHandlingTest(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["copied"], 2)
         self.assertEqual(duplicate.added_keyframes, [("Pan", 0, 0.1), ("Pan", 12, 0.4)])
+
+    def test_bulk_set_item_properties_accepts_enabled_only(self):
+        item = PropertyCopyItemStub()
+        item.enabled = True
+        tl = BulkSetTimelineStub(video_items=[item])
+
+        result = _timeline_bulk_set_item_properties(tl, {
+            "ops": [{"timeline_item_id": item.GetUniqueId(), "enabled": False}],
+        })
+
+        self.assertTrue(result["success"])
+        self.assertFalse(item.enabled)
+        enabled = result["results"][0]["enabled"]
+        self.assertTrue(enabled["success"])
+        self.assertFalse(enabled["readback"])
+        self.assertEqual(item.set_property_calls, [])
+
+    def test_bulk_set_item_properties_hoists_enabled_from_properties(self):
+        item = PropertyCopyItemStub()
+        item.enabled = True
+        tl = BulkSetTimelineStub(video_items=[item])
+
+        result = _timeline_bulk_set_item_properties(tl, {
+            "ops": [{
+                "timeline_item_id": item.GetUniqueId(),
+                "properties": {"enabled": "false", "Pan": 0.5},
+            }],
+            "readback": True,
+        })
+
+        self.assertTrue(result["success"])
+        self.assertFalse(item.enabled)
+        self.assertEqual(item.properties["Pan"], 0.5)
+        self.assertEqual(item.set_property_calls, [("Pan", 0.5)])
+        self.assertEqual(result["results"][0]["enabled"]["source"], "properties.enabled")
+
+    def test_coerce_bool_value_handles_string_false(self):
+        self.assertEqual(_coerce_bool_value("false", "enabled"), (False, None))
+        self.assertEqual(_coerce_bool_value("off", "enabled"), (False, None))
+        self.assertEqual(_coerce_bool_value("true", "enabled"), (True, None))
+        self.assertEqual(_coerce_bool_value(None, "enabled", False), (False, None))
+
+    def test_param_bool_handles_string_false_defaults(self):
+        self.assertFalse(_param_bool({"dry_run": "false"}, "dry_run", True))
+        self.assertTrue(_param_bool({"readback": "yes"}, "readback", False))
+        self.assertTrue(_param_bool({}, "readback", True))
 
     def test_edit_kernel_capabilities_reports_boundaries(self):
         caps = _timeline_edit_kernel_capabilities()

@@ -6,7 +6,7 @@ Complete Resolve scripting API coverage, live-test status, and method-by-method 
 
 | Metric | Value |
 |--------|-------|
-| MCP Tools | **33** compound (default) / **329** granular |
+| MCP Tools | **34** compound (default) / **330** granular |
 | Kernel Actions | **136** guarded MCP workflow actions across 9 compound tools |
 | API Methods Covered | **336/336** (100%) |
 | Methods Live Tested | **331/336** (98.5%) |
@@ -17,13 +17,12 @@ Complete Resolve scripting API coverage, live-test status, and method-by-method 
 
 ## API Coverage
 
-Every non-deprecated method in the DaVinci Resolve Scripting API is covered. The default compound server exposes **33 tools** that group related operations by action parameter, keeping LLM context windows lean. The full granular server provides **329 individual tools** for power users. Both modes cover all 13 API object classes. MCP-level kernel actions are tracked separately in [Kernel Action Coverage](../kernels/README.md).
+Every non-deprecated method in the DaVinci Resolve Scripting API is covered. The default compound server exposes **34 tools** that group related operations by action parameter, keeping LLM context windows lean. The full granular server provides **330 individual tools** for power users. Both modes cover all 13 API object classes. MCP-level kernel actions are tracked separately in [Kernel Action Coverage](../kernels/README.md).
 
-The 33rd compound tool is `timeline_versioning` (C6) — an MCP-level workflow
-tool, not a wrapper around a Resolve API method. It surfaces the
-version-on-mutate hook that auto-archives the working timeline before any
-destructive op, plus rollback and brain-edit history. See [SKILL.md](../SKILL.md)
-for usage.
+Some compound tools are MCP-level workflow tools rather than one-to-one Resolve
+API wrappers. For example, `timeline_versioning` surfaces the version-on-mutate
+hook that auto-archives the working timeline before destructive ops, plus
+rollback and brain-edit history. See [SKILL.md](../SKILL.md) for usage.
 
 Workflow helpers can go beyond one-to-one API method coverage while still using
 only public Resolve calls. For example, `media_pool.setup_multicam_timeline`

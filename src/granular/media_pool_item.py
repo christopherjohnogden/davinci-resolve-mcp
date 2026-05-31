@@ -6,6 +6,25 @@ from src.utils.media_analysis import mark_registry_stale_for_clip as _mark_analy
 resolve = ResolveProxy()
 
 
+def _param_bool(params, key, default=False):
+    if key not in params:
+        return default
+    raw = params.get(key)
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return default
+    if isinstance(raw, (int, float)) and raw in (0, 1):
+        return bool(raw)
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+            return True
+        if value in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+    return default
+
+
 def _invalidate_analysis_registry_for_clip(project, clip, *, reason: str) -> Optional[Dict[str, Any]]:
     """Best-effort: mark cached analysis stale after a Resolve clip replace.
 
@@ -1218,12 +1237,12 @@ def clip_transcript(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
             return {"error": f"Clip {clip_id} not found"}
         return _build_transcript_payload(
             project, mp, clip,
-            with_timecodes=bool(p.get("with_timecodes", False)),
+            with_timecodes=_param_bool(p, "with_timecodes", False),
             wait_seconds=int(p.get("wait_seconds", 30)),
         )
 
     if action == "get_all":
-        with_tc = bool(p.get("with_timecodes", False))
+        with_tc = _param_bool(p, "with_timecodes", False)
         wait_seconds = int(p.get("wait_seconds", 30))
         transcripts = []
         for clip in get_all_media_pool_clips(mp):
@@ -1240,7 +1259,7 @@ def clip_transcript(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         clips, terr = _resolve_target_clips(project, mp, p)
         if terr:
             return terr
-        skip_existing = bool(p.get("skip_existing", True))
+        skip_existing = _param_bool(p, "skip_existing", True)
         # TranscribeAudio takes an optional speaker-detection bool (NOT language).
         use_sd = p.get("use_speaker_detection")
         started, skipped, failed = [], [], []

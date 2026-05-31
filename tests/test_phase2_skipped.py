@@ -7,6 +7,10 @@ Run with: python3 tests/test_phase2_skipped.py
 Requires DaVinci Resolve Studio running with 'Sample' project open.
 """
 
+if __name__ != "__main__":
+    import unittest
+    raise unittest.SkipTest("live Resolve API phase validation script; run directly")
+
 import sys
 import os
 import json

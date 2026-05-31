@@ -70,6 +70,89 @@ def _appended_item_summary(item):
         name = None
     return {"timeline_item_id": item_id, "name": name}
 
+
+def _safe_granular_media_pool_item_id(item):
+    try:
+        item_id = item.GetUniqueId()
+        return None if item_id in (None, "") else str(item_id)
+    except Exception:
+        return None
+
+
+def _append_info_track_type(info):
+    try:
+        media_type = int(info.get("mediaType", 1))
+    except (TypeError, ValueError):
+        media_type = 1
+    return "audio" if media_type == 2 else "video"
+
+
+def _recover_positioned_append_summary(timeline, info):
+    if not timeline:
+        return None
+    try:
+        track_type = _append_info_track_type(info)
+        track_index = int(info["trackIndex"])
+        record_frame = int(info["recordFrame"])
+        duration = int(info["endFrame"]) - int(info["startFrame"])
+        source_id = _safe_granular_media_pool_item_id(info["mediaPoolItem"])
+        items = timeline.GetItemListInTrack(track_type, track_index) or []
+    except Exception:
+        return None
+    matches = []
+    for item in items:
+        try:
+            start = _frame_int(item.GetStart())
+            item_duration = _frame_int(item.GetDuration()) if _has_method(item, "GetDuration") else None
+            media_pool_item = item.GetMediaPoolItem()
+        except Exception:
+            continue
+        if item_duration is None:
+            try:
+                end = _frame_int(item.GetEnd())
+                item_duration = end - start if start is not None and end is not None else None
+            except Exception:
+                item_duration = None
+        if start != record_frame or item_duration != duration:
+            continue
+        if source_id and _safe_granular_media_pool_item_id(media_pool_item) != source_id:
+            continue
+        summary = _appended_item_summary(item)
+        if summary.get("timeline_item_id"):
+            matches.append(summary)
+    return matches[-1] if matches else None
+
+
+def _serialize_positioned_append_result(timeline, built, result, before_summaries=None):
+    before_summaries = before_summaries or []
+    items_out = []
+    warnings = []
+    if len(result or []) != len(built):
+        warnings.append(f"AppendToTimeline returned {len(result or [])} item(s) for {len(built)} clip_infos")
+    for index, item in enumerate(result or []):
+        if not item:
+            return None, {"success": False, "error": f"Missing timeline item at index {index}"}, warnings
+        summary = _appended_item_summary(item)
+        if not summary.get("timeline_item_id") and index < len(built):
+            recovered = _recover_positioned_append_summary(timeline, built[index])
+            if recovered:
+                before = before_summaries[index] if index < len(before_summaries) else None
+                summary = {
+                    **recovered,
+                    "recovered_from_timeline_scan": True,
+                    **(
+                        {"already_present_before_append": True}
+                        if before and before.get("timeline_item_id") == recovered.get("timeline_item_id")
+                        else {}
+                    ),
+                }
+            else:
+                summary["append_readback_warning"] = "Resolve returned a thin timeline item without a readable id"
+                warnings.append(f"clip_infos[{index}] appended but Resolve did not expose a readable timeline item id")
+        items_out.append(summary)
+    return items_out, None, warnings
+
+
 @mcp.resource("resolve://media-pool-clips")
 def list_media_pool_clips() -> List[Dict[str, Any]]:
     """List all clips in the root folder of the media pool."""
@@ -177,22 +260,38 @@ def append_to_timeline(
             if row_err:
                 return row_err
             built.append(row)
+        before_summaries = [_recover_positioned_append_summary(current_timeline, row) for row in built]
         result = mp.AppendToTimeline(built)
         if not result:
+            already_present = [
+                {**summary, "already_present_before_append": True}
+                for summary in before_summaries
+                if summary and summary.get("timeline_item_id")
+            ]
+            if len(already_present) == len(built):
+                return {
+                    "success": True,
+                    "count": 0,
+                    "append_return_count": 0,
+                    "already_present_count": len(already_present),
+                    "items": already_present,
+                    "warnings": [
+                        "AppendToTimeline returned no new items, but matching timeline items already existed at the requested record frames."
+                    ],
+                }
             return {"success": False, "error": "Failed to append clip_infos to timeline"}
-        items_out = []
-        for i, item in enumerate(result):
-            if not item:
-                return {"success": False, "error": f"Missing timeline item at index {i}"}
-            try:
-                item_id = item.GetUniqueId()
-                name = item.GetName()
-            except Exception as exc:
-                return {"success": False, "error": f"Invalid timeline item at index {i}: {exc}"}
-            if not item_id:
-                return {"success": False, "error": f"Missing timeline item id at index {i}"}
-            items_out.append({"timeline_item_id": item_id, "name": name})
-        return {"success": True, "count": len(items_out), "items": items_out}
+        items_out, item_err, warnings = _serialize_positioned_append_result(
+            current_timeline,
+            built,
+            result,
+            before_summaries=before_summaries,
+        )
+        if item_err:
+            return item_err
+        payload = {"success": True, "count": len(items_out or []), "append_return_count": len(result), "items": items_out or []}
+        if warnings:
+            payload["warnings"] = warnings
+        return payload
     if not clip_ids:
         return {"error": "Provide clip_ids (simple) or clip_infos (positioned)"}
     root = mp.GetRootFolder()

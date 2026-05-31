@@ -8,6 +8,7 @@ from src.server import (
     _probe_audio_item,
     _safe_auto_sync_audio,
     _safe_set_audio_properties,
+    _sync_media_pool_audio,
     _subtitle_generation_probe,
     _transcription_capabilities,
     _voice_isolation_capabilities,
@@ -140,8 +141,19 @@ class TimelineStub:
 
 
 class FolderStub:
+    def __init__(self, name="Master", clips=None, subfolders=None):
+        self.name = name
+        self.clips = clips or []
+        self.subfolders = subfolders or []
+
     def GetName(self):
-        return "Master"
+        return self.name
+
+    def GetClipList(self):
+        return self.clips
+
+    def GetSubFolderList(self):
+        return self.subfolders
 
     def TranscribeAudio(self):
         return True
@@ -151,10 +163,14 @@ class FolderStub:
 
 
 class MediaPoolStub:
-    def __init__(self, clip=None, clips=None):
+    def __init__(self, clip=None, clips=None, subfolders=None):
         self.clip = clip or MediaPoolItemStub()
-        self.clips = clips or [self.clip]
+        self.clips = [self.clip] if clips is None else clips
+        self.subfolders = subfolders or []
         self.auto_sync_calls = []
+
+    def GetName(self):
+        return "Master"
 
     def GetRootFolder(self):
         return self
@@ -163,10 +179,10 @@ class MediaPoolStub:
         return self.clips
 
     def GetSubFolderList(self):
-        return []
+        return self.subfolders
 
     def GetCurrentFolder(self):
-        return FolderStub()
+        return self
 
     def GetSelectedClips(self):
         return self.clips
@@ -264,6 +280,27 @@ class AudioFairlightProbeTest(unittest.TestCase):
         self.assertEqual(result["linked_count"], 2)
         self.assertEqual(result["linked"][0]["sound_roll"], "lav.wav")
         self.assertEqual(result["linked"][0]["audio_offset"], "12.34")
+
+    def test_sync_media_pool_audio_collects_recursive_bins(self):
+        cam_a = MediaPoolItemStub("cam-a.mov", "cam-a", "Video + Audio")
+        cam_b = MediaPoolItemStub("cam-b.mov", "cam-b", "Video + Audio")
+        lav_a = MediaPoolItemStub("lav-a.wav", "lav-a", "Audio")
+        lav_b = MediaPoolItemStub("lav-b.wav", "lav-b", "Audio")
+        camera_bin = FolderStub("Camera", clips=[cam_a, cam_b])
+        audio_bin = FolderStub("Audio", clips=[lav_a, lav_b])
+        footage_bin = FolderStub("01_Footage", subfolders=[camera_bin, audio_bin])
+        pool = MediaPoolStub(clips=[], subfolders=[footage_bin])
+
+        result = _sync_media_pool_audio(pool, {})
+
+        self.assertTrue(result["batch_by_video"])
+        self.assertEqual(pool.auto_sync_calls, [
+            ["cam-a.mov", "lav-a.wav", "lav-b.wav"],
+            ["cam-b.mov", "lav-a.wav", "lav-b.wav"],
+        ])
+        self.assertEqual(result["linked_count"], 2)
+        self.assertEqual(result["video_count"], 2)
+        self.assertEqual(result["audio_candidate_count"], 2)
 
     def test_subtitle_generation_probe_is_dry_run_by_default(self):
         timeline = TimelineStub()
