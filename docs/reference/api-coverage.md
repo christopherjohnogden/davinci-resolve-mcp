@@ -6,7 +6,7 @@ Complete Resolve scripting API coverage, live-test status, and method-by-method 
 
 | Metric | Value |
 |--------|-------|
-| MCP Tools | **34** compound (default) / **330** granular |
+| MCP Tools | **40** compound (default) / **330** granular |
 | Kernel Actions | **136** guarded MCP workflow actions across 9 compound tools |
 | API Methods Covered | **336/336** (100%) |
 | Methods Live Tested | **331/336** (98.5%) |
@@ -17,7 +17,7 @@ Complete Resolve scripting API coverage, live-test status, and method-by-method 
 
 ## API Coverage
 
-Every non-deprecated method in the DaVinci Resolve Scripting API is covered. The default compound server exposes **34 tools** that group related operations by action parameter, keeping LLM context windows lean. The full granular server provides **330 individual tools** for power users. Both modes cover all 13 API object classes. MCP-level kernel actions are tracked separately in [Kernel Action Coverage](../kernels/README.md).
+Every non-deprecated method in the DaVinci Resolve Scripting API is covered. The default compound server exposes **40 tools** that group related operations by action parameter, keeping LLM context windows lean. The full granular server provides **330 individual tools** for power users. Both modes cover all 13 API object classes. MCP-level kernel actions are tracked separately in [Kernel Action Coverage](../kernels/README.md).
 
 Some compound tools are MCP-level workflow tools rather than one-to-one Resolve
 API wrappers. For example, `timeline_versioning` surfaces the version-on-mutate

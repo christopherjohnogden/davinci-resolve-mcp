@@ -1,9 +1,9 @@
 # DaVinci Resolve MCP Server
 
-[![Version](https://img.shields.io/badge/version-2.27.5-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
+[![Version](https://img.shields.io/badge/version-2.30.1-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
 [![npm](https://img.shields.io/npm/v/davinci-resolve-mcp.svg?label=npm&color=CB3837)](https://www.npmjs.com/package/davinci-resolve-mcp)
 [![API Coverage](https://img.shields.io/badge/API%20Coverage-100%25-brightgreen.svg)](docs/reference/api-coverage.md)
-[![Tools](https://img.shields.io/badge/MCP%20Tools-34%20(330%20full)-blue.svg)](#server-modes)
+[![Tools](https://img.shields.io/badge/MCP%20Tools-40%20(330%20full)-blue.svg)](#server-modes)
 [![Tested](https://img.shields.io/badge/Live%20Tested-98.5%25-green.svg)](docs/reference/api-coverage.md#test-results)
 [![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-18.5+-darkred.svg)](https://www.blackmagicdesign.com/products/davinciresolve)
 [![Python](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/downloads/)
@@ -49,7 +49,7 @@ The command starts a localhost server and opens the control panel in your browse
 
 | Mode | Entry point | Tools | Best for |
 |------|-------------|-------|----------|
-| Compound | `src/server.py` | 34 | Default mode for most assistants. Related Resolve operations are grouped behind action parameters to keep context usage low. |
+| Compound | `src/server.py` | 40 | Default mode for most assistants. Related Resolve operations are grouped behind action parameters to keep context usage low. |
 | Full / granular | `src/server.py --full` or `src/resolve_mcp_server.py` | 330 | Power users who want one MCP tool per Resolve API method. |
 
 The compound server is recommended unless you specifically need the granular one-tool-per-method surface.
@@ -61,6 +61,9 @@ The compound server is recommended unless you specifically need the granular one
 "Create a timeline called 'Assembly Cut' from all clips in the current bin"
 "Build a multicam prep timeline from selected camera angles and preserve source media"
 "Detect 2-pops or slate claps and suggest record offsets for sync prep"
+"Analyze YOLO pose motion once per clip and reuse source-frame gesture events for cut-on-action decisions"
+"Analyze visual structure once per clip: objects, shot size, camera motion, expression, and searchable rollups"
+"Transcribe source clips locally with Parakeet/MLX, cache source-frame word timings, and export per-clip SRTs"
 "Publish analysis summaries, keywords, people, and slate hints into Resolve clip metadata"
 "Probe this timeline for gaps, overlaps, missing media, and source frame ranges"
 "Safely import this image sequence, organize it into bins, and normalize clip metadata"
@@ -78,7 +81,7 @@ The compound server is recommended unless you specifically need the granular one
 |------|-----------------------------------|
 | App and project control | Launch/reconnect, page switching, project CRUD, project folders, databases, cloud project wrappers, settings, presets, archives |
 | Media pool and ingest | Safe import, image sequences, multicam prep timelines, bin organization, metadata normalization, metadata field inventory, marks, annotations, relink/proxy/full-resolution guards |
-| Media analysis | Source-safe file/clip/bin/project analysis, 2-pop/slate-clap sync-event detection, default Resolve metadata and Media Pool marker writeback, persisted analysis artifacts, existing-report reuse, host_chat_paths visual analysis (finalized per clip with `commit_vision`, works with any vision-capable MCP client) with opt-out, transcription with opt-out |
+| Media analysis | Source-safe file/clip/bin/project analysis, 2-pop/slate-clap sync-event detection, YOLO Pose motion sidecars, dense visual sidecars for objects/shot size/camera motion/expression, standard metadata rollups for Smart Bin search, default Resolve metadata and Media Pool marker writeback, persisted analysis artifacts, existing-report reuse, host_chat_paths visual analysis (finalized per clip with `commit_vision`, works with any vision-capable MCP client) with opt-out, transcription with opt-out |
 | Timeline editing and conform | Track/item probing, title text key scans/writes, copy/move/duplicate helpers, range operations, gaps/overlaps, source ranges, checked interchange exports/imports |
 | Review annotations | Timeline/item/clip markers, custom data, flags, clip color, copy/move/sync cleanup, review reports, marker thumbnail review |
 | Color and grading | Node graph probing, CDL validation, grade copy, DRX/LUT helpers, versions, Gallery stills, color groups |
@@ -99,7 +102,7 @@ The default server is a local stdio process launched by your MCP client; it does
 
 | Metric | Value |
 |--------|-------|
-| MCP Tools | **34** compound / **330** granular |
+| MCP Tools | **40** compound / **330** granular |
 | Kernel Actions | **136** guarded workflow actions across 9 compound tools |
 | API Methods Covered | **336/336** (100%) |
 | Methods Live Tested | **331/336** (98.5%) |
@@ -135,6 +138,8 @@ Extension authoring references live in [docs/authoring](docs/authoring/). Resolv
 - DaVinci Resolve Studio 18.5+ on macOS, Windows, or Linux. The free edition does not support external scripting.
 - Python 3.10+ (3.10-3.12 is the lowest-risk range). Python 3.13/3.14 also work on recent Resolve builds (verified on Studio 20.3.2); older builds may fail to connect on 3.13+, in which case use 3.10-3.12.
 - Resolve external scripting set to **Local**.
+- Optional for `analyze_motion` / `analyze_clip_visual`: FFmpeg/FFprobe plus `numpy`, `opencv-python`, `ultralytics`, and optional expression/VLM packages in the MCP Python environment. Deep visual analysis defaults to Ollama via `vlm_model="ollama:qwen3-vl:8b"` and can also use a local Transformers Qwen model path/id.
+- Optional for `analyze_clip_transcript`: `parakeet-mlx` in the MCP Python environment. It writes transcript sidecars, metadata projections, and per-clip SRTs; it does not inject external transcripts into Resolve's native Audio Transcription panel.
 
 Resolve 19.1.3 remains the compatibility baseline. Resolve 20.x scripting calls are additive, version-guarded, and live-tested on 20.3.2. Resolve 21 beta APIs are intentionally deferred until stable.
 

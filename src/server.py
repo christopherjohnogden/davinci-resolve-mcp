@@ -2,8 +2,9 @@
 """
 DaVinci Resolve MCP Server (Compound Tools)
 
-34 compound tools covering 100% of the DaVinci Resolve Scripting API (336 methods)
-plus Fusion Fuse, DCTL, and Resolve-page Script authoring tools.
+40 MCP tools covering 100% of the DaVinci Resolve Scripting API (336 methods)
+plus Fusion Fuse, DCTL, Resolve-page Script authoring tools, and source-safe
+motion, visual, and transcript analysis.
 Each tool groups related operations via an 'action' parameter.
 
 Usage:
@@ -11,7 +12,7 @@ Usage:
     python src/server.py --full       # Start the 330-tool granular server instead
 """
 
-VERSION = "2.27.5"
+VERSION = "2.30.1"
 
 import base64
 import os
@@ -74,6 +75,35 @@ from src.utils.media_analysis import (
     resolve_output_root as resolve_media_analysis_output_root,
     slugify,
     summarize_reports as summarize_media_analysis_reports,
+)
+from src.utils.motion_analysis import (
+    POSE_METADATA_KEY,
+    build_pose_pointer,
+    motion_sidecar_path,
+    read_motion_sidecar,
+    run_yolo_pose_analysis,
+    summarize_motion_events,
+    write_json_atomic,
+    parse_float as _motion_parse_float,
+    parse_int as _motion_parse_int,
+)
+from src.utils.visual_analysis import (
+    DEFAULT_OLLAMA_VLM_MODEL,
+    VISUAL_METADATA_FIELDS,
+    read_visual_sidecar,
+    run_clip_visual_analysis,
+    visual_sidecar_path,
+)
+from src.utils.transcript_analysis import (
+    DEFAULT_PARAKEET_MODEL,
+    TRANSCRIPT_METADATA_FIELDS,
+    read_transcript_sidecar,
+    run_parakeet_transcription,
+    transcript_sidecar_path,
+    transcript_srt_path,
+    transcript_to_srt,
+    transcript_keywords,
+    write_transcript_srt,
 )
 from src.utils.sync_detection import detect_sync_events_for_records as detect_media_sync_events
 from src.utils.media_analysis_jobs import (
@@ -224,7 +254,9 @@ def _annotations_for_tool_name(tool_name: str) -> mcp_types.ToolAnnotations:
         "color_group",
         "fusion_comp",
     )
-    if name == "media_analysis":
+    if name in {"get_motion", "get_visual", "get_transcript"}:
+        return EXTERNAL_READ_TOOL
+    if name in {"media_analysis", "analyze_motion", "analyze_clip_visual", "analyze_clip_transcript"}:
         return EXTERNAL_WRITE_TOOL
     if name in external_tools:
         return EXTERNAL_DESTRUCTIVE_TOOL
@@ -271,7 +303,7 @@ def davinci_resolve_workflow() -> str:
     return """Use this DaVinci Resolve MCP server as a guarded post-production control surface.
 
 Core pattern:
-- Prefer the 34 compound tools and their action names over raw scripting.
+- Prefer the 40 compound tools and their action names over raw scripting.
 - Start by probing state: resolve_control.get_version/get_page, project_manager.get_current, timeline.get_current, and media_pool.probe_media_pool.
 - Before mutating timelines, media pools, render settings, grades, projects, databases, or extensions, prefer the matching probe, capabilities, boundary_report, safe_*, or dry_run action when one exists.
 - Preserve source media integrity. Never transcode, proxy, rewrite, move, rename, or create derivatives of source media unless the user explicitly asks. Analysis output belongs in sidecars or analysis directories.
@@ -13746,7 +13778,669 @@ def media_pool_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TOOL 13b: clip_transcript
+# TOOL 13b/13c: YOLO pose motion analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _motion_project_name(project) -> str:
+    try:
+        return project.GetName() or "Project"
+    except Exception:
+        return "Project"
+
+
+def _motion_clip_context(project, clip) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    props, props_error = _safe_clip_call(clip, "GetClipProperty", "")
+    props = props if isinstance(props, dict) else {}
+    media_id, media_id_error = _safe_clip_call(clip, "GetMediaId")
+    clip_name = _safe_media_pool_item_name(clip)
+    if not media_id:
+        return None, _err(
+            f"Could not read media_id for clip {clip_name}",
+            code="MOTION_NO_MEDIA_ID",
+            category="resolve_api_failed",
+        )
+    file_path = props.get("File Path") or props.get("FilePath")
+    if not file_path:
+        return None, _err(
+            f"Could not read File Path for clip {media_id}",
+            code="MOTION_NO_FILE_PATH",
+            category="resolve_api_failed",
+            details={"clip_properties_error": props_error, "media_id_error": media_id_error},
+        )
+    fps = (
+        _motion_parse_float(props.get("FPS"), 0.0)
+        or _motion_parse_float(props.get("Frame Rate"), 0.0)
+        or _motion_parse_float(props.get("FrameRate"), 0.0)
+    )
+    duration_frames = (
+        _motion_parse_int(props.get("Frames"), 0)
+        or _motion_parse_int(props.get("Frame Count"), 0)
+        or _motion_parse_int(props.get("FrameCount"), 0)
+        or _motion_parse_int(props.get("Duration Frames"), 0)
+    )
+    project_name = _motion_project_name(project)
+    return {
+        "project_name": project_name,
+        "clip_id": _safe_media_pool_item_id(clip),
+        "media_id": str(media_id),
+        "clip_name": clip_name,
+        "file_path": str(file_path),
+        "fps": fps,
+        "duration_frames": duration_frames,
+    }, None
+
+
+def _stamp_pose_pointer(
+    clip,
+    *,
+    project_name: str,
+    media_id: str,
+    event_count: int,
+    model: str,
+    analyzed_at: str,
+) -> Dict[str, Any]:
+    pointer = build_pose_pointer(project_name, media_id, event_count, model, analyzed_at)
+    result = {
+        "metadata_key": POSE_METADATA_KEY,
+        "metadata_value": pointer,
+        "metadata_written": False,
+    }
+    try:
+        result["metadata_written"] = bool(clip.SetMetadata(POSE_METADATA_KEY, pointer))
+    except Exception as exc:
+        result["metadata_error"] = str(exc)
+    if not result["metadata_written"]:
+        result["metadata_note"] = (
+            "Resolve did not accept the pose_analysis metadata field. "
+            "The sidecar remains the source of truth and get_motion will read it by media_id."
+        )
+    return result
+
+
+def _motion_target_clip(clip_id: str):
+    _, proj, mp, err = _get_mp()
+    if err:
+        return None, None, err
+    clip = _find_clip(mp.GetRootFolder(), clip_id or "")
+    if not clip:
+        return None, None, _err(
+            f"Clip not found: {clip_id}",
+            code="CLIP_NOT_FOUND",
+            category="precondition",
+        )
+    return proj, clip, None
+
+
+@mcp.tool()
+def analyze_motion(
+    clip_id: str,
+    force: bool = False,
+    sample_every_n: int = 3,
+    proxy_width: int = 640,
+    model: str = "yolo11n-pose",
+) -> Dict[str, Any]:
+    """Analyze one media-pool clip with YOLO Pose and cache source-frame motion events.
+
+    Source-safe behavior:
+      - Reads the source media through ffmpeg.
+      - Writes one sidecar JSON to ~/Resolve_Analysis/<project>/<media_id>_pose.json.
+      - Stamps a small pose_analysis metadata pointer when Resolve accepts the field.
+      - Never modifies, transcodes, proxies, replaces, or relinks source media.
+
+    Returns a compact event summary; call get_motion(include_frames=true) only when
+    downstream code needs the raw sampled pose track.
+    """
+    proj, clip, err = _motion_target_clip(clip_id)
+    if err:
+        return err
+    context, context_err = _motion_clip_context(proj, clip)
+    if context_err:
+        return context_err
+    assert context is not None
+    sidecar = motion_sidecar_path(context["project_name"], context["media_id"])
+    if sidecar.exists() and not force:
+        cached = read_motion_sidecar(sidecar, include_frames=False) or {}
+        event_count = len(cached.get("events") or [])
+        stamp = _stamp_pose_pointer(
+            clip,
+            project_name=context["project_name"],
+            media_id=context["media_id"],
+            event_count=event_count,
+            model=str(cached.get("model") or model),
+            analyzed_at=str(cached.get("analyzed_at") or ""),
+        )
+        return {
+            "analyzed": "cached",
+            "media_id": context["media_id"],
+            "sidecar_path": str(sidecar),
+            "event_count": event_count,
+            "events_summary": summarize_motion_events(cached.get("events") or []),
+            **stamp,
+        }
+
+    try:
+        payload = run_yolo_pose_analysis(
+            file_path=context["file_path"],
+            media_id=context["media_id"],
+            clip_name=context["clip_name"],
+            fps=context["fps"],
+            duration_frames=context["duration_frames"],
+            sample_every_n=sample_every_n,
+            proxy_width=proxy_width,
+            model=model,
+        )
+    except Exception as exc:
+        return {
+            "analyzed": False,
+            "media_id": context["media_id"],
+            "clip_name": context["clip_name"],
+            "file_path": context["file_path"],
+            "sidecar_path": str(sidecar),
+            "error": str(exc),
+            "remediation": (
+                "If this is a missing YOLO runtime, install the optional dependencies "
+                "in the MCP environment: venv/bin/python -m pip install numpy ultralytics"
+            ),
+            "note": "No partial pose sidecar was written.",
+        }
+
+    write_json_atomic(sidecar, payload)
+    events = payload.get("events") or []
+    stamp = _stamp_pose_pointer(
+        clip,
+        project_name=context["project_name"],
+        media_id=context["media_id"],
+        event_count=len(events),
+        model=str(payload.get("model") or model),
+        analyzed_at=str(payload.get("analyzed_at") or ""),
+    )
+    return {
+        "analyzed": True,
+        "media_id": context["media_id"],
+        "sidecar_path": str(sidecar),
+        "event_count": len(events),
+        "events_summary": summarize_motion_events(events),
+        **stamp,
+    }
+
+
+@mcp.tool()
+def get_motion(clip_id: str, include_frames: bool = False) -> Dict[str, Any]:
+    """Read cached YOLO Pose motion events for one media-pool clip.
+
+    This is a pure read and never runs analysis. If no sidecar exists, it returns
+    analyzed=false so the caller can decide whether to run analyze_motion.
+    """
+    proj, clip, err = _motion_target_clip(clip_id)
+    if err:
+        return err
+    context, context_err = _motion_clip_context(proj, clip)
+    if context_err:
+        return context_err
+    assert context is not None
+    sidecar = motion_sidecar_path(context["project_name"], context["media_id"])
+    data = read_motion_sidecar(sidecar, include_frames=include_frames)
+    if data is None:
+        return {
+            "analyzed": False,
+            "media_id": context["media_id"],
+            "sidecar_path": str(sidecar),
+        }
+    data["sidecar_path"] = str(sidecar)
+    data["event_count"] = len(data.get("events") or [])
+    data["events_summary"] = summarize_motion_events(data.get("events") or [])
+    return data
+
+
+def _visual_metadata_values(rollup: Dict[str, Any]) -> Dict[str, str]:
+    keywords = rollup.get("keywords") or []
+    if not isinstance(keywords, list):
+        keywords = [str(keywords)]
+    description = str(rollup.get("description") or "").strip()
+    shot_size = str(rollup.get("shot_size") or "").strip()
+    camera = str(rollup.get("camera") or "").strip()
+    tone = str(rollup.get("tone") or "").strip()
+    comments = "; ".join(
+        part for part in [
+            f"camera: {camera}" if camera else "",
+            f"tone: {tone}" if tone else "",
+            description,
+        ]
+        if part
+    )
+    return {
+        "Description": description,
+        "Comments": comments,
+        "Keywords": ", ".join(str(keyword) for keyword in keywords if keyword),
+        "Shot": shot_size,
+    }
+
+
+def _write_visual_metadata(clip, rollup: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
+    values = _visual_metadata_values(rollup)
+    results: Dict[str, Any] = {"dry_run": bool(dry_run), "fields": {}}
+    for field in VISUAL_METADATA_FIELDS:
+        value = values.get(field, "")
+        if not value:
+            results["fields"][field] = {"skipped": True, "reason": "empty"}
+            continue
+        if dry_run:
+            results["fields"][field] = {"would_write": True, "value": value}
+            continue
+        try:
+            results["fields"][field] = {"success": bool(clip.SetMetadata(field, value)), "value": value}
+        except Exception as exc:
+            results["fields"][field] = {"success": False, "error": str(exc), "value": value}
+    results["success"] = all(
+        bool(entry.get("success") or entry.get("skipped") or entry.get("would_write"))
+        for entry in results["fields"].values()
+    )
+    return results
+
+
+def _existing_clip_metadata(clip) -> Dict[str, Any]:
+    try:
+        data = clip.GetMetadata() or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _append_metadata_section(existing: str, label: str, text: str, max_chars: int) -> str:
+    existing = str(existing or "").strip()
+    text = str(text or "").strip()
+    if not text:
+        return existing[:max_chars]
+    section = f"{label}:\n{text}"
+    if label.lower() + ":" in existing.lower():
+        # Regenerable projection: replace the old transcript section instead of
+        # repeatedly appending on re-analysis.
+        pattern = re.compile(rf"\n*\b{re.escape(label)}:\n.*", flags=re.IGNORECASE | re.DOTALL)
+        combined = pattern.sub("", existing).strip()
+    else:
+        combined = existing
+    value = f"{combined}\n\n{section}".strip() if combined else section
+    if len(value) > max_chars:
+        value = value[: max(0, max_chars - 3)].rstrip() + "..."
+    return value
+
+
+def _merge_keywords(existing: Any, additions: List[str], max_keywords: int = 48) -> str:
+    parts: List[str] = []
+    if isinstance(existing, str):
+        parts.extend(item.strip() for item in re.split(r"[,;\n]+", existing) if item.strip())
+    elif isinstance(existing, list):
+        parts.extend(str(item).strip() for item in existing if str(item).strip())
+    parts.extend(str(item).strip() for item in additions if str(item).strip())
+    deduped: List[str] = []
+    seen = set()
+    for item in parts:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+        if len(deduped) >= max_keywords:
+            break
+    return ", ".join(deduped)
+
+
+def _transcript_metadata_values(clip, payload: Dict[str, Any], max_chars: int = 8000) -> Dict[str, str]:
+    metadata = _existing_clip_metadata(clip)
+    text = str(payload.get("text") or "").strip()
+    rollup = payload.get("metadata_rollup") or {}
+    description = str(metadata.get("Description") or "").strip()
+    if not description and rollup.get("description"):
+        description = str(rollup.get("description") or "")[:700]
+    comments = _append_metadata_section(str(metadata.get("Comments") or ""), "Transcript", text, max_chars=max_chars)
+    keywords = _merge_keywords(metadata.get("Keywords"), list(rollup.get("keywords") or []))
+    return {
+        "Description": description,
+        "Comments": comments,
+        "Keywords": keywords,
+    }
+
+
+def _write_transcript_metadata(clip, payload: Dict[str, Any], dry_run: bool = False, max_chars: int = 8000) -> Dict[str, Any]:
+    values = _transcript_metadata_values(clip, payload, max_chars=max_chars)
+    results: Dict[str, Any] = {"dry_run": bool(dry_run), "fields": {}}
+    for field in TRANSCRIPT_METADATA_FIELDS:
+        value = values.get(field, "")
+        if not value:
+            results["fields"][field] = {"skipped": True, "reason": "empty"}
+            continue
+        if dry_run:
+            results["fields"][field] = {"would_write": True, "value": value}
+            continue
+        try:
+            results["fields"][field] = {"success": bool(clip.SetMetadata(field, value)), "value": value}
+        except Exception as exc:
+            results["fields"][field] = {"success": False, "error": str(exc), "value": value}
+    results["success"] = all(
+        bool(entry.get("success") or entry.get("skipped") or entry.get("would_write"))
+        for entry in results["fields"].values()
+    )
+    return results
+
+
+def _import_srt_to_subtitles_bin(project_name: str, media_id: str, clip_name: str, payload: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
+    srt_path = transcript_srt_path(project_name, media_id, clip_name)
+    if dry_run:
+        return {"dry_run": True, "would_write": str(srt_path), "would_import_to": "Master/Subtitles"}
+    write_transcript_srt(srt_path, payload)
+    _, _, mp, err = _get_mp()
+    if err:
+        return {"success": False, "srt_path": str(srt_path), "error": err}
+    folder, folder_err = _ensure_folder_path(mp, "Subtitles")
+    if folder_err:
+        return {"success": False, "srt_path": str(srt_path), "error": folder_err}
+    previous = mp.GetCurrentFolder()
+    try:
+        if not mp.SetCurrentFolder(folder):
+            return {"success": False, "srt_path": str(srt_path), "error": "Failed to set Subtitles media-pool bin"}
+        imported = mp.ImportMedia([str(srt_path)]) or []
+        return {"success": True, "srt_path": str(srt_path), **_imported_clip_summaries(imported)}
+    except Exception as exc:
+        return {"success": False, "srt_path": str(srt_path), "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        _restore_current_folder(mp, previous)
+
+
+@mcp.tool()
+def analyze_clip_visual(
+    clip_id: str,
+    tier: str = "fast",
+    force: bool = False,
+    sample_every_n: int = 5,
+    proxy_width: int = 640,
+    dry_run: bool = False,
+    write_metadata: bool = True,
+    pose_model: str = "yolo11n-pose",
+    object_model: str = "yolo11n",
+    expression: bool = True,
+    expression_every_n: int = 2,
+    vlm_model: Optional[str] = DEFAULT_OLLAMA_VLM_MODEL,
+    vlm_max_keyframes: int = 12,
+) -> Dict[str, Any]:
+    """Run source-safe visual analysis and cache a visual sidecar for one clip.
+
+    Fast tier runs dense pose, object detection, shot size, camera motion, and
+    optional expression analysis from one sampled decode loop. Deep tier is
+    reserved for opt-in local VLM enrichment.
+    """
+    proj, clip, err = _motion_target_clip(clip_id)
+    if err:
+        return err
+    context, context_err = _motion_clip_context(proj, clip)
+    if context_err:
+        return context_err
+    assert context is not None
+    sidecar = visual_sidecar_path(context["project_name"], context["media_id"])
+    if sidecar.exists() and not force:
+        cached = read_visual_sidecar(sidecar, include_frames=False) or {}
+        metadata_result = None
+        if write_metadata and cached.get("metadata_rollup"):
+            metadata_result = _write_visual_metadata(clip, cached.get("metadata_rollup") or {}, dry_run=dry_run)
+        return {
+            "analyzed": "cached",
+            "media_id": context["media_id"],
+            "sidecar_path": str(sidecar),
+            "event_count": len(cached.get("events") or []),
+            "events_summary": summarize_motion_events(cached.get("events") or []),
+            "metadata_rollup": cached.get("metadata_rollup") or {},
+            "metadata_writeback": metadata_result,
+        }
+
+    try:
+        payload = run_clip_visual_analysis(
+            file_path=context["file_path"],
+            media_id=context["media_id"],
+            clip_name=context["clip_name"],
+            fps=context["fps"],
+            duration_frames=context["duration_frames"],
+            tier=tier,
+            sample_every_n=sample_every_n,
+            proxy_width=proxy_width,
+            pose_model=pose_model,
+            object_model=object_model,
+            expression=bool(expression),
+            expression_every_n=expression_every_n,
+            vlm_model=vlm_model,
+            vlm_max_keyframes=vlm_max_keyframes,
+        )
+    except Exception as exc:
+        return {
+            "analyzed": False,
+            "media_id": context["media_id"],
+            "clip_name": context["clip_name"],
+            "file_path": context["file_path"],
+            "sidecar_path": str(sidecar),
+            "error": str(exc),
+            "note": "No partial visual sidecar was written.",
+        }
+
+    write_json_atomic(sidecar, payload)
+    metadata_result = None
+    if write_metadata:
+        metadata_result = _write_visual_metadata(clip, payload.get("metadata_rollup") or {}, dry_run=dry_run)
+    return {
+        "analyzed": True,
+        "media_id": context["media_id"],
+        "sidecar_path": str(sidecar),
+        "event_count": len(payload.get("events") or []),
+        "events_summary": summarize_motion_events(payload.get("events") or []),
+        "metadata_rollup": payload.get("metadata_rollup") or {},
+        "metadata_writeback": metadata_result,
+        "models": payload.get("models") or {},
+        "tier": payload.get("tier"),
+    }
+
+
+@mcp.tool()
+def get_visual(clip_id: str, include_frames: bool = False) -> Dict[str, Any]:
+    """Read cached visual sidecar data for one media-pool clip; never analyzes."""
+    proj, clip, err = _motion_target_clip(clip_id)
+    if err:
+        return err
+    context, context_err = _motion_clip_context(proj, clip)
+    if context_err:
+        return context_err
+    assert context is not None
+    sidecar = visual_sidecar_path(context["project_name"], context["media_id"])
+    data = read_visual_sidecar(sidecar, include_frames=include_frames)
+    if data is None:
+        return {
+            "analyzed": False,
+            "media_id": context["media_id"],
+            "sidecar_path": str(sidecar),
+        }
+    data["sidecar_path"] = str(sidecar)
+    data["event_count"] = len(data.get("events") or [])
+    data["events_summary"] = summarize_motion_events(data.get("events") or [])
+    return data
+
+
+@mcp.tool()
+def analyze_clip_transcript(
+    clip_id: str,
+    force: bool = False,
+    model: str = DEFAULT_PARAKEET_MODEL,
+    dry_run: bool = False,
+    write_metadata: bool = True,
+    export_srt: bool = True,
+    import_srt: bool = True,
+    max_metadata_chars: int = 8000,
+    chunk_duration: float = 120.0,
+    overlap_duration: float = 15.0,
+    max_words: int = 16,
+    silence_gap: float = 0.7,
+    max_duration: float = 6.0,
+    fp32: bool = False,
+    cache_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run local Parakeet transcription and cache source-frame transcript timings.
+
+    This does not write to Resolve's native Audio Transcription panel. It writes
+    a transcript sidecar, optional metadata projection, and optional per-clip SRT
+    imported into a Subtitles media-pool bin.
+    """
+    proj, clip, err = _motion_target_clip(clip_id)
+    if err:
+        return err
+    context, context_err = _motion_clip_context(proj, clip)
+    if context_err:
+        return context_err
+    assert context is not None
+    sidecar = transcript_sidecar_path(context["project_name"], context["media_id"])
+    srt_path = transcript_srt_path(context["project_name"], context["media_id"], context["clip_name"])
+
+    if dry_run and (force or not sidecar.exists()):
+        return {
+            "analyzed": False,
+            "dry_run": True,
+            "would_analyze": True,
+            "media_id": context["media_id"],
+            "clip_name": context["clip_name"],
+            "file_path": context["file_path"],
+            "sidecar_path": str(sidecar),
+            "srt_path": str(srt_path),
+            "model": model,
+        }
+
+    if sidecar.exists() and not force:
+        cached = read_transcript_sidecar(sidecar, include_words=True) or {}
+        metadata_result = None
+        if write_metadata:
+            metadata_result = _write_transcript_metadata(
+                clip,
+                cached,
+                dry_run=dry_run,
+                max_chars=int(max_metadata_chars or 8000),
+            )
+        srt_result = None
+        if export_srt or import_srt:
+            if import_srt:
+                srt_result = _import_srt_to_subtitles_bin(
+                    context["project_name"],
+                    context["media_id"],
+                    context["clip_name"],
+                    cached,
+                    dry_run=dry_run,
+                )
+            elif not dry_run:
+                write_transcript_srt(srt_path, cached)
+                srt_result = {"success": True, "srt_path": str(srt_path), "imported": 0}
+            else:
+                srt_result = {"dry_run": True, "would_write": str(srt_path)}
+        return {
+            "analyzed": "cached",
+            "media_id": context["media_id"],
+            "sidecar_path": str(sidecar),
+            "srt_path": str(srt_path),
+            "line_count": len(cached.get("lines") or []),
+            "word_count": (cached.get("metadata_rollup") or {}).get("word_count"),
+            "text_preview": str(cached.get("text") or "")[:500],
+            "metadata_writeback": metadata_result,
+            "srt": srt_result,
+        }
+
+    try:
+        payload = run_parakeet_transcription(
+            file_path=context["file_path"],
+            media_id=context["media_id"],
+            clip_name=context["clip_name"],
+            fps=context["fps"],
+            duration_frames=context["duration_frames"],
+            model=model,
+            cache_dir=cache_dir,
+            fp32=bool(fp32),
+            chunk_duration=float(chunk_duration or 120.0),
+            overlap_duration=float(overlap_duration or 15.0),
+            max_words=int(max_words or 16),
+            silence_gap=float(silence_gap or 0.7),
+            max_duration=float(max_duration or 6.0),
+        )
+    except Exception as exc:
+        return {
+            "analyzed": False,
+            "media_id": context["media_id"],
+            "clip_name": context["clip_name"],
+            "file_path": context["file_path"],
+            "sidecar_path": str(sidecar),
+            "error": str(exc),
+            "remediation": (
+                "Install the local transcription runtime in the MCP environment: "
+                "venv/bin/python -m pip install parakeet-mlx"
+            ),
+            "note": "No partial transcript sidecar was written.",
+        }
+
+    payload["srt_path"] = str(srt_path)
+    write_json_atomic(sidecar, payload)
+    metadata_result = None
+    if write_metadata:
+        metadata_result = _write_transcript_metadata(
+            clip,
+            payload,
+            dry_run=dry_run,
+            max_chars=int(max_metadata_chars or 8000),
+        )
+    srt_result = None
+    if export_srt or import_srt:
+        if import_srt:
+            srt_result = _import_srt_to_subtitles_bin(
+                context["project_name"],
+                context["media_id"],
+                context["clip_name"],
+                payload,
+                dry_run=dry_run,
+            )
+        elif not dry_run:
+            write_transcript_srt(srt_path, payload)
+            srt_result = {"success": True, "srt_path": str(srt_path), "imported": 0}
+        else:
+            srt_result = {"dry_run": True, "would_write": str(srt_path)}
+    return {
+        "analyzed": True,
+        "media_id": context["media_id"],
+        "sidecar_path": str(sidecar),
+        "srt_path": str(srt_path),
+        "line_count": len(payload.get("lines") or []),
+        "word_count": (payload.get("metadata_rollup") or {}).get("word_count"),
+        "text_preview": str(payload.get("text") or "")[:500],
+        "metadata_writeback": metadata_result,
+        "srt": srt_result,
+        "engine": payload.get("engine"),
+        "model": payload.get("model"),
+    }
+
+
+@mcp.tool()
+def get_transcript(clip_id: str, include_words: bool = True) -> Dict[str, Any]:
+    """Read cached local transcript sidecar data for one media-pool clip."""
+    proj, clip, err = _motion_target_clip(clip_id)
+    if err:
+        return err
+    context, context_err = _motion_clip_context(proj, clip)
+    if context_err:
+        return context_err
+    assert context is not None
+    sidecar = transcript_sidecar_path(context["project_name"], context["media_id"])
+    data = read_transcript_sidecar(sidecar, include_words=include_words)
+    if data is None:
+        return {
+            "analyzed": False,
+            "media_id": context["media_id"],
+            "sidecar_path": str(sidecar),
+        }
+    data["sidecar_path"] = str(sidecar)
+    data["line_count"] = len(data.get("lines") or [])
+    data["word_count"] = (data.get("metadata_rollup") or {}).get("word_count")
+    return data
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOOL 13d/13e: clip_transcript
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
@@ -13901,6 +14595,12 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
     commit_vision        -> {analysis_json, marker_plan_json, metadata_publish}
     summarize            -> {clips_summarized, summary, provenance: {source_reports, missing_reports}}
     review_timeline_markers -> {path, samples, vision_review?}
+    analyze_motion       -> {analyzed, media_id, sidecar_path, event_count, events_summary}
+    get_motion           -> {analyzed, media_id, events, [frames]}
+    analyze_clip_visual  -> {analyzed, media_id, sidecar_path, metadata_rollup}
+    get_visual           -> cached visual sidecar; never triggers analysis
+    analyze_clip_transcript -> {analyzed, media_id, sidecar_path, srt_path}
+    get_transcript       -> cached transcript sidecar; never triggers analysis
     start_batch_job      -> {job_id, status}
     batch_job_status     -> {job_id, status, progress, recent_events, clip_states}
     All actions may return {"error": {code, category, retryable, message, remediation, reason?}}.
@@ -13923,6 +14623,12 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
       analyze_sequence(timeline_index?, track_types?, dry_run?, session_only?, persist?) -> {clips, manifest}
       analyze_timeline(...) -> alias for analyze_sequence on the current timeline
       detect_sync_events(paths?|target?, event_types?, windows?) -> {files, alignment}
+      analyze_motion(clip_id, force?, sample_every_n?, proxy_width?, model?) -> cached YOLO Pose source-frame motion analysis under ~/Resolve_Analysis
+      get_motion(clip_id, include_frames?) -> read cached source-frame motion events; never runs YOLO
+      analyze_clip_visual(clip_id, tier?, force?, sample_every_n?, dry_run?) -> source-safe dense visual analysis + metadata rollup
+      get_visual(clip_id, include_frames?) -> read cached visual sidecar; never runs analysis
+      analyze_clip_transcript(clip_id, force?, model?, dry_run?, export_srt?, import_srt?) -> local Parakeet transcript sidecar + metadata/SRT projection
+      get_transcript(clip_id, include_words?) -> read cached source-frame transcript; never runs transcription
       add_sync_event_markers(target?|paths?|detections?, confirm?) -> {added, skipped}
       publish_clip_metadata(target?, fields?, slate_detection?, timed_markers?|write_markers?, dry_run?, confirm?) -> {results}
       commit_vision(clip_id|file_path|clip_dir, visual, vision_token?, analysis_root?, publish_metadata?, dry_run?, confirm?) -> {analysis_json, marker_plan_json, metadata_publish}
@@ -14125,6 +14831,82 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
         project_name = p.get("project_name") or p.get("projectName")
     if p.get("project_id") or p.get("projectId"):
         project_id = p.get("project_id") or p.get("projectId")
+
+    if action == "analyze_motion":
+        clip_id = p.get("clip_id") or p.get("clipId")
+        if not clip_id:
+            return _err("analyze_motion requires clip_id")
+        return analyze_motion(
+            str(clip_id),
+            force=_media_analysis_bool(p.get("force"), False),
+            sample_every_n=int(p.get("sample_every_n", p.get("sampleEveryN", 3)) or 3),
+            proxy_width=int(p.get("proxy_width", p.get("proxyWidth", 640)) or 640),
+            model=str(p.get("model") or "yolo11n-pose"),
+        )
+    if action == "get_motion":
+        clip_id = p.get("clip_id") or p.get("clipId")
+        if not clip_id:
+            return _err("get_motion requires clip_id")
+        return get_motion(
+            str(clip_id),
+            include_frames=_media_analysis_bool(p.get("include_frames", p.get("includeFrames")), False),
+        )
+    if action == "analyze_clip_visual":
+        clip_id = p.get("clip_id") or p.get("clipId")
+        if not clip_id:
+            return _err("analyze_clip_visual requires clip_id")
+        return analyze_clip_visual(
+            str(clip_id),
+            tier=str(p.get("tier") or "fast"),
+            force=_media_analysis_bool(p.get("force"), False),
+            sample_every_n=int(p.get("sample_every_n", p.get("sampleEveryN", 5)) or 5),
+            proxy_width=int(p.get("proxy_width", p.get("proxyWidth", 640)) or 640),
+            dry_run=_media_analysis_bool(p.get("dry_run", p.get("dryRun")), False),
+            write_metadata=_media_analysis_bool(p.get("write_metadata", p.get("writeMetadata")), True),
+            pose_model=str(p.get("pose_model", p.get("poseModel", "yolo11n-pose"))),
+            object_model=str(p.get("object_model", p.get("objectModel", "yolo11n"))),
+            expression=_media_analysis_bool(p.get("expression"), True),
+            expression_every_n=int(p.get("expression_every_n", p.get("expressionEveryN", 2)) or 2),
+            vlm_model=p.get("vlm_model") or p.get("vlmModel"),
+            vlm_max_keyframes=int(p.get("vlm_max_keyframes", p.get("vlmMaxKeyframes", 12)) or 12),
+        )
+    if action == "get_visual":
+        clip_id = p.get("clip_id") or p.get("clipId")
+        if not clip_id:
+            return _err("get_visual requires clip_id")
+        return get_visual(
+            str(clip_id),
+            include_frames=_media_analysis_bool(p.get("include_frames", p.get("includeFrames")), False),
+        )
+    if action == "analyze_clip_transcript":
+        clip_id = p.get("clip_id") or p.get("clipId")
+        if not clip_id:
+            return _err("analyze_clip_transcript requires clip_id")
+        return analyze_clip_transcript(
+            str(clip_id),
+            force=_media_analysis_bool(p.get("force"), False),
+            model=str(p.get("model") or DEFAULT_PARAKEET_MODEL),
+            dry_run=_media_analysis_bool(p.get("dry_run", p.get("dryRun")), False),
+            write_metadata=_media_analysis_bool(p.get("write_metadata", p.get("writeMetadata")), True),
+            export_srt=_media_analysis_bool(p.get("export_srt", p.get("exportSrt")), True),
+            import_srt=_media_analysis_bool(p.get("import_srt", p.get("importSrt")), True),
+            max_metadata_chars=int(p.get("max_metadata_chars", p.get("maxMetadataChars", 8000)) or 8000),
+            chunk_duration=float(p.get("chunk_duration", p.get("chunkDuration", 120.0)) or 120.0),
+            overlap_duration=float(p.get("overlap_duration", p.get("overlapDuration", 15.0)) or 15.0),
+            max_words=int(p.get("max_words", p.get("maxWords", 16)) or 16),
+            silence_gap=float(p.get("silence_gap", p.get("silenceGap", 0.7)) or 0.7),
+            max_duration=float(p.get("max_duration", p.get("maxDuration", 6.0)) or 6.0),
+            fp32=_media_analysis_bool(p.get("fp32"), False),
+            cache_dir=p.get("cache_dir") or p.get("cacheDir"),
+        )
+    if action == "get_transcript":
+        clip_id = p.get("clip_id") or p.get("clipId")
+        if not clip_id:
+            return _err("get_transcript requires clip_id")
+        return get_transcript(
+            str(clip_id),
+            include_words=_media_analysis_bool(p.get("include_words", p.get("includeWords")), True),
+        )
 
     if action == "resolve_output_root":
         return resolve_media_analysis_output_root(
@@ -14596,6 +15378,12 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
         "analyze_sequence",
         "analyze_timeline",
         "detect_sync_events",
+        "analyze_motion",
+        "get_motion",
+        "analyze_clip_visual",
+        "get_visual",
+        "analyze_clip_transcript",
+        "get_transcript",
         "add_sync_event_markers",
         "publish_clip_metadata",
         "commit_vision",
@@ -20407,5 +21195,5 @@ if __name__ == "__main__":
         run_fastmcp_stdio(granular_mcp)
         sys.exit(0)
 
-    logger.info(f"Starting DaVinci Resolve MCP Server (34 compound tools)")
+    logger.info(f"Starting DaVinci Resolve MCP Server (40 compound tools)")
     run_fastmcp_stdio(mcp)

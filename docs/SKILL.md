@@ -100,7 +100,7 @@ before mutating Resolve state.
 
 | Mode | Entry point | Tool count | Use when |
 |---|---|---|---|
-| Compound (default) | `src/server.py` | 34 tools | Most workflows — keeps context lean |
+| Compound (default) | `src/server.py` | 40 tools | Most workflows — keeps context lean |
 | Granular (full) | `src/server.py --full` | 330 tools | Power users needing one tool per API method |
 
 This skill document covers the **compound server** (the default). Each compound
@@ -440,6 +440,43 @@ All actions require a `clip_id`.
 Key actions: `add(frame, color, name, note, duration)`, `get_all`, `delete_by_color(color)`,
 `delete_at_frame(frame)`, `add_flag(color)`, `get_flags`, `set_name(name)`
 
+**`analyze_motion` / `get_motion`** — Source-safe YOLO Pose motion sidecars.
+
+`analyze_motion(clip_id, force=false, sample_every_n=3, proxy_width=640,
+model="yolo11n-pose")` runs once per media-pool clip, writes
+`~/Resolve_Analysis/<project>/<media_id>_pose.json`, and attempts to stamp a
+short `pose_analysis` metadata pointer on the clip. `get_motion(clip_id,
+include_frames=false)` is pure read: it returns cached source-frame gesture
+events and only includes the raw pose track when explicitly requested. Missing
+FFmpeg/Ultralytics or offline source media must return `analyzed=false` without
+writing a partial sidecar. Source installs can add the optional runtime with
+`venv/bin/python -m pip install numpy ultralytics`.
+
+**`analyze_clip_visual` / `get_visual`** — Source-safe dense visual sidecars.
+
+`analyze_clip_visual(clip_id, tier="fast", force=false, sample_every_n=5,
+dry_run=false)` runs one shared decode loop for pose, objects, shot size, camera
+motion, and optional expression. It writes
+`~/Resolve_Analysis/<project>/<media_id>_visual.json` and writes a compact
+projection to standard Resolve metadata fields (`Description`, `Comments`,
+`Keywords`, `Shot`) unless `dry_run=true` or `write_metadata=false`.
+`get_visual(clip_id, include_frames=false)` is pure read for edit decisions.
+`tier="deep"` is opt-in VLM enrichment and defaults to
+`vlm_model="ollama:qwen3-vl:8b"`. Pass a different local Ollama model or a local
+Transformers Qwen model path/id when needed.
+Fast tier is the default production path.
+
+**`analyze_clip_transcript` / `get_transcript`** — Local Parakeet transcript sidecars.
+
+`analyze_clip_transcript(clip_id, force=false, model="mlx-community/parakeet-tdt-0.6b-v3",
+dry_run=false)` runs external Parakeet/MLX transcription and writes
+`~/Resolve_Analysis/<project>/<media_id>_transcript.json` with source-frame
+line and word timings. It can project transcript text into standard metadata
+fields and export/import a per-clip SRT into a `Subtitles` media-pool bin. This
+does not populate Resolve's native Audio Transcription panel because Resolve
+does not expose an API for injecting external transcript text there.
+`get_transcript(clip_id, include_words=true)` is pure read.
+
 **`media_analysis`** — Project-scoped media intelligence and guarded metadata publishing.
 
 Media Analysis and editorial-assist actions (v2.17.0+) add source-safe planning,
@@ -451,6 +488,8 @@ Key actions: `capabilities`, `get_caps`, `get_usage`, `install_guidance`,
 `resolve_output_root`, `plan`,
 `coverage_report`, `analyze_file`, `analyze_clip`, `analyze_bin`,
 `analyze_project`, `detect_sync_events`, `add_sync_event_markers`,
+`analyze_motion`, `get_motion`, `analyze_clip_visual`, `get_visual`,
+`analyze_clip_transcript`, `get_transcript`,
 `publish_clip_metadata`, `commit_vision`, `summarize`, `get_report`,
 `build_index`, `index_status`, `query_index`, `start_batch_job`,
 `run_batch_job_slice`, `batch_job_status`, `list_batch_jobs`,

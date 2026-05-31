@@ -128,6 +128,9 @@ davinci-resolve-mcp-analysis/
 **/.davinci-resolve-mcp-analysis/
 **/davinci-resolve-mcp-analysis/
 
+# Local ML model weights downloaded on demand (for example YOLO pose).
+*.pt
+
 # Local scratch / personal tooling attached to this project.
 # Holds things like the screenshot capture script, release-notes drafts,
 # and one-off repro scripts. Never shipped. See local/README.md.
