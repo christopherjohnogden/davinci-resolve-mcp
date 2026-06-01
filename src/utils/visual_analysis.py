@@ -53,8 +53,92 @@ OLLAMA_VLM_JSON_SCHEMA = {
     "required": ["shot_type", "description", "story_beat", "story_note", "keywords", "tone"],
     "additionalProperties": False,
 }
+VLM_CLIP_SUMMARY_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "clip_summary": {"type": "string"},
+        "visual_timeline": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start_seconds": {"type": "number"},
+                    "end_seconds": {"type": "number"},
+                    "summary": {"type": "string"},
+                    "editorial_value": {"type": "string"},
+                },
+                "required": ["start_seconds", "end_seconds", "summary", "editorial_value"],
+                "additionalProperties": False,
+            },
+        },
+        "important_moments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "time_seconds": {"type": "number"},
+                    "frame": {"type": "integer"},
+                    "moment": {"type": "string"},
+                    "why_it_matters": {"type": "string"},
+                },
+                "required": ["time_seconds", "frame", "moment", "why_it_matters"],
+                "additionalProperties": False,
+            },
+        },
+        "editorial_opportunities": {"type": "array", "items": {"type": "string"}},
+        "search_keywords": {"type": "array", "items": {"type": "string"}},
+        "confidence_notes": {"type": "string"},
+    },
+    "required": [
+        "clip_summary",
+        "visual_timeline",
+        "important_moments",
+        "editorial_opportunities",
+        "search_keywords",
+        "confidence_notes",
+    ],
+    "additionalProperties": False,
+}
 _OBJECT_IGNORE = {"person"}
 _VLM_CACHE: Dict[str, Any] = {}
+
+
+def adaptive_vlm_keyframe_count(
+    duration_frames: Any,
+    fps: Any,
+    *,
+    max_count: int = 120,
+) -> int:
+    """Choose a VLM keyframe budget from clip length.
+
+    The dense CV passes decide where action happens; this count decides how much
+    visual context the VLM needs to summarize the full clip without sampling
+    every few frames.
+    """
+
+    try:
+        frames = max(0, int(float(duration_frames or 0)))
+    except Exception:
+        frames = 0
+    try:
+        rate = float(fps or 0.0)
+    except Exception:
+        rate = 0.0
+    seconds = frames / rate if frames and rate > 0 else 0.0
+    if seconds <= 0:
+        return 24
+    if seconds < 90:
+        return 24
+    if seconds < 120:
+        return 32
+    if seconds <= 240:
+        return 48
+    if seconds <= 600:
+        return 72
+    # Long-form clips should eventually be summarized in chunks. Until the
+    # chunked summarizer exists, keep roughly one frame every 10 seconds with a
+    # hard cap so one long source cannot monopolize a worker.
+    return min(max(72, int(round(seconds / 10.0))), max(72, int(max_count or 120)))
 
 
 def visual_sidecar_path(project_name: Any, media_id: Any, root: Optional[str] = None) -> Path:
@@ -129,7 +213,7 @@ def run_clip_visual_analysis(
     expression: bool = True,
     expression_every_n: int = 2,
     vlm_model: Optional[str] = None,
-    vlm_max_keyframes: int = 12,
+    vlm_max_keyframes: int = 0,
 ) -> Dict[str, Any]:
     if not file_path or not os.path.exists(file_path):
         raise RuntimeError(f"Media file is offline or missing: {file_path}")
@@ -619,7 +703,8 @@ def _merge_vlm_metadata_rollup(rollup: Dict[str, Any], vlm: Dict[str, Any]) -> D
     if not isinstance(vlm, dict) or vlm.get("status") != "analyzed":
         return rollup
     merged = dict(rollup)
-    description = str(vlm.get("description") or "").strip()
+    clip_summary = vlm.get("clip_summary") if isinstance(vlm.get("clip_summary"), dict) else {}
+    description = str(clip_summary.get("clip_summary") or vlm.get("description") or "").strip()
     if description:
         merged["description"] = description
     shot_type = str(vlm.get("shot_type") or "").strip()
@@ -634,6 +719,7 @@ def _merge_vlm_metadata_rollup(rollup: Dict[str, Any], vlm: Dict[str, Any]) -> D
         tone = str(keyframe.get("tone") or "").strip()
         if tone and tone != "unknown":
             tones.append(tone)
+    keywords.extend(str(keyword) for keyword in (clip_summary.get("search_keywords") or []) if keyword)
     if tones:
         merged["tone"] = Counter(tones).most_common(1)[0][0]
     merged["keywords"] = sorted({keyword for keyword in keywords if keyword and keyword != "unknown"})
@@ -654,7 +740,7 @@ def _run_deep_vlm(
     expression_events: List[Dict[str, Any]],
     camera: Dict[str, Any],
     rollup: Dict[str, Any],
-    max_keyframes: int = 12,
+    max_keyframes: int = 0,
 ) -> Dict[str, Any]:
     if tier != "deep":
         return {"status": "skipped", "reason": "tier=fast"}
@@ -667,13 +753,14 @@ def _run_deep_vlm(
             "keyframes": [],
             "story_beats": [],
         }
+    effective_max_keyframes = int(max_keyframes or 0) or adaptive_vlm_keyframe_count(duration_frames, fps)
     keyframes = _select_vlm_keyframes(
         duration_frames=duration_frames,
         sample_every_n=sample_every_n,
         pose_events=pose_events,
         expression_events=expression_events,
         camera=camera,
-        max_keyframes=max_keyframes,
+        max_keyframes=effective_max_keyframes,
     )
     try:
         images = _extract_keyframe_images(file_path, keyframes, width, height)
@@ -694,6 +781,15 @@ def _run_deep_vlm(
         }
     shot_types = [item.get("shot_type") for item in analyzed if item.get("shot_type")]
     descriptions = [item.get("description") for item in analyzed if item.get("description")]
+    clip_summary = _summarize_vlm_keyframes(
+        model_name=str(vlm_model),
+        clip_name="",
+        fps=fps,
+        duration_frames=duration_frames,
+        keyframes=analyzed,
+        rollup=rollup,
+        camera=camera,
+    )
     story_beats = [
         {"frame": item.get("frame"), "note": item.get("story_note") or item.get("description")}
         for item in analyzed
@@ -703,8 +799,9 @@ def _run_deep_vlm(
         "status": "analyzed",
         "model": vlm_model,
         "shot_type": Counter(shot_types).most_common(1)[0][0] if shot_types else rollup.get("camera"),
-        "description": " / ".join(descriptions[:3]) if descriptions else rollup.get("description"),
+        "description": str(clip_summary.get("clip_summary") or "").strip() or (" / ".join(descriptions[:3]) if descriptions else rollup.get("description")),
         "keyframes": analyzed,
+        "clip_summary": clip_summary,
         "story_beats": story_beats,
     }
 
@@ -716,9 +813,9 @@ def _select_vlm_keyframes(
     pose_events: List[Dict[str, Any]],
     expression_events: List[Dict[str, Any]],
     camera: Dict[str, Any],
-    max_keyframes: int = 12,
+    max_keyframes: int = 24,
 ) -> List[int]:
-    max_keyframes = max(1, int(max_keyframes or 12))
+    max_keyframes = max(1, int(max_keyframes or 24))
     frame_limit = max(0, int(duration_frames or 0) - 1)
     if frame_limit <= 0:
         return [0]
@@ -850,17 +947,324 @@ def _analyze_vlm_keyframe(
         model, processor = _load_qwen_vlm(model_name)
         raw = _generate_qwen_response(model, processor, image, prompt)
     parsed = _parse_vlm_json(raw)
+    fallback_description = _extract_json_string_field(raw, "description") or _clean_vlm_text(raw)
     return {
         "frame": frame,
         "time_seconds": round(frame / fps, 3) if fps else None,
         "shot_type": parsed.get("shot_type") or rollup.get("camera"),
-        "description": parsed.get("description") or raw.strip(),
+        "description": parsed.get("description") or fallback_description,
         "story_beat": _boolish(parsed.get("story_beat")),
         "story_note": parsed.get("story_note") or parsed.get("note") or "",
         "keywords": parsed.get("keywords") or [],
         "tone": parsed.get("tone") or rollup.get("tone"),
         "raw_response": raw,
     }
+
+
+def _summarize_vlm_keyframes(
+    *,
+    model_name: str,
+    clip_name: str,
+    fps: float,
+    duration_frames: int,
+    keyframes: List[Dict[str, Any]],
+    rollup: Dict[str, Any],
+    camera: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not keyframes:
+        return _fallback_clip_summary(clip_name, fps, duration_frames, keyframes)
+    if fps and duration_frames and (float(duration_frames) / float(fps)) >= 600 and len(keyframes) >= 12:
+        return _summarize_vlm_keyframes_chunked(
+            model_name=model_name,
+            clip_name=clip_name,
+            fps=fps,
+            duration_frames=duration_frames,
+            keyframes=keyframes,
+            rollup=rollup,
+            camera=camera,
+        )
+    prompt = _vlm_clip_summary_prompt(
+        clip_name=clip_name,
+        fps=fps,
+        duration_frames=duration_frames,
+        keyframes=keyframes,
+        rollup=rollup,
+        camera=camera,
+    )
+    try:
+        if _is_ollama_vlm_model(model_name):
+            raw = _generate_ollama_text_response(model_name, prompt, VLM_CLIP_SUMMARY_JSON_SCHEMA, max_tokens=1800)
+        else:
+            model, processor = _load_qwen_vlm(model_name)
+            raw = _generate_qwen_text_response(model, processor, prompt, max_new_tokens=1800)
+        parsed = _parse_vlm_json(raw)
+    except Exception as exc:
+        fallback = _fallback_clip_summary(clip_name, fps, duration_frames, keyframes)
+        fallback["status"] = "fallback"
+        fallback["reason"] = f"{type(exc).__name__}: {exc}"
+        return fallback
+    if not parsed:
+        fallback = _fallback_clip_summary(clip_name, fps, duration_frames, keyframes)
+        fallback["status"] = "fallback"
+        fallback["reason"] = "The clip-summary model did not return parseable JSON."
+        fallback["raw_response"] = raw
+        return fallback
+    normalized = _normalize_clip_summary(parsed, clip_name, fps, duration_frames, keyframes)
+    normalized["status"] = "analyzed"
+    normalized["raw_response"] = raw
+    return normalized
+
+
+def _summarize_vlm_keyframes_chunked(
+    *,
+    model_name: str,
+    clip_name: str,
+    fps: float,
+    duration_frames: int,
+    keyframes: List[Dict[str, Any]],
+    rollup: Dict[str, Any],
+    camera: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Summarize long videos as sections, then combine the section map.
+
+    A single giant long-video prompt tends to lose the middle of the clip. This
+    keeps local detail by summarizing 1-2 minute sections first, then asking for
+    a whole-clip map from those section summaries.
+    """
+
+    section_seconds = 120.0
+    sections: List[Dict[str, Any]] = []
+    raw_responses: List[str] = []
+    try:
+        for start_second in _section_starts(duration_frames, fps, section_seconds):
+            end_second = min(start_second + section_seconds, duration_frames / fps)
+            section_frames = [
+                item for item in keyframes
+                if start_second <= _safe_number(item.get("time_seconds"), 0.0) < end_second
+            ]
+            if not section_frames:
+                continue
+            prompt = _vlm_clip_summary_prompt(
+                clip_name=f"{clip_name} section {round(start_second)}-{round(end_second)}s",
+                fps=fps,
+                duration_frames=duration_frames,
+                keyframes=section_frames,
+                rollup=rollup,
+                camera=camera,
+            )
+            raw = _generate_vlm_text(model_name, prompt, max_tokens=1400)
+            raw_responses.append(raw)
+            parsed = _parse_vlm_json(raw)
+            normalized = _normalize_clip_summary(parsed, clip_name, fps, duration_frames, section_frames) if parsed else _fallback_clip_summary(clip_name, fps, duration_frames, section_frames)
+            sections.append(
+                {
+                    "start_seconds": round(start_second, 3),
+                    "end_seconds": round(end_second, 3),
+                    "clip_summary": normalized.get("clip_summary"),
+                    "visual_timeline": normalized.get("visual_timeline") or [],
+                    "important_moments": normalized.get("important_moments") or [],
+                    "editorial_opportunities": normalized.get("editorial_opportunities") or [],
+                    "search_keywords": normalized.get("search_keywords") or [],
+                    "confidence_notes": normalized.get("confidence_notes") or "",
+                }
+            )
+        if not sections:
+            fallback = _fallback_clip_summary(clip_name, fps, duration_frames, keyframes)
+            fallback["status"] = "fallback"
+            fallback["reason"] = "No long-video sections had VLM keyframes."
+            return fallback
+        final_prompt = _vlm_section_summary_prompt(
+            clip_name=clip_name,
+            fps=fps,
+            duration_frames=duration_frames,
+            sections=sections,
+            rollup=rollup,
+        )
+        raw_final = _generate_vlm_text(model_name, final_prompt, max_tokens=1800)
+        parsed_final = _parse_vlm_json(raw_final)
+        if not parsed_final:
+            fallback = _fallback_clip_summary(clip_name, fps, duration_frames, keyframes)
+            fallback["status"] = "fallback"
+            fallback["reason"] = "The long-video final summary did not return parseable JSON."
+            fallback["section_summaries"] = sections
+            fallback["raw_response"] = raw_final
+            return fallback
+        normalized_final = _normalize_clip_summary(parsed_final, clip_name, fps, duration_frames, keyframes)
+        normalized_final["status"] = "analyzed"
+        normalized_final["summary_mode"] = "sectioned"
+        normalized_final["section_seconds"] = section_seconds
+        normalized_final["section_summaries"] = sections
+        normalized_final["raw_response"] = raw_final
+        normalized_final["section_raw_responses"] = raw_responses
+        return normalized_final
+    except Exception as exc:
+        fallback = _fallback_clip_summary(clip_name, fps, duration_frames, keyframes)
+        fallback["status"] = "fallback"
+        fallback["summary_mode"] = "sectioned"
+        fallback["reason"] = f"{type(exc).__name__}: {exc}"
+        fallback["section_summaries"] = sections
+        return fallback
+
+
+def _generate_vlm_text(model_name: str, prompt: str, max_tokens: int = 1800) -> str:
+    if _is_ollama_vlm_model(model_name):
+        return _generate_ollama_text_response(model_name, prompt, VLM_CLIP_SUMMARY_JSON_SCHEMA, max_tokens=max_tokens)
+    model, processor = _load_qwen_vlm(model_name)
+    return _generate_qwen_text_response(model, processor, prompt, max_new_tokens=max_tokens)
+
+
+def _section_starts(duration_frames: int, fps: float, section_seconds: float) -> List[float]:
+    duration = float(duration_frames) / float(fps or 24.0) if duration_frames else 0.0
+    starts = []
+    current = 0.0
+    while current < duration:
+        starts.append(current)
+        current += section_seconds
+    return starts or [0.0]
+
+
+def _normalize_clip_summary(
+    parsed: Dict[str, Any],
+    clip_name: str,
+    fps: float,
+    duration_frames: int,
+    keyframes: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    fallback = _fallback_clip_summary(clip_name, fps, duration_frames, keyframes)
+    if not isinstance(parsed, dict):
+        return fallback
+    out = dict(fallback)
+    clip_summary = str(parsed.get("clip_summary") or "").strip()
+    if clip_summary:
+        out["clip_summary"] = _clean_clip_summary_style(clip_summary)
+    timeline = parsed.get("visual_timeline")
+    if isinstance(timeline, list) and timeline:
+        out["visual_timeline"] = [
+            {
+                "start_seconds": _safe_number(item.get("start_seconds"), 0.0),
+                "end_seconds": _safe_number(item.get("end_seconds"), _safe_number(item.get("start_seconds"), 0.0)),
+                "summary": str(item.get("summary") or "").strip(),
+                "editorial_value": str(item.get("editorial_value") or "").strip(),
+            }
+            for item in timeline
+            if isinstance(item, dict) and str(item.get("summary") or "").strip()
+        ][:12] or out["visual_timeline"]
+    moments = parsed.get("important_moments")
+    if isinstance(moments, list) and moments:
+        out["important_moments"] = [
+            {
+                "time_seconds": _safe_number(item.get("time_seconds"), 0.0),
+                "frame": int(_safe_number(item.get("frame"), 0)),
+                "moment": str(item.get("moment") or "").strip(),
+                "why_it_matters": str(item.get("why_it_matters") or "").strip(),
+            }
+            for item in moments
+            if isinstance(item, dict) and str(item.get("moment") or "").strip()
+        ][:16] or out["important_moments"]
+    opportunities = parsed.get("editorial_opportunities")
+    if isinstance(opportunities, list):
+        out["editorial_opportunities"] = [str(item).strip() for item in opportunities if str(item).strip()][:12]
+    keywords = parsed.get("search_keywords")
+    if isinstance(keywords, list):
+        out["search_keywords"] = sorted({str(item).strip() for item in keywords if str(item).strip()})[:40]
+    notes = str(parsed.get("confidence_notes") or "").strip()
+    if notes:
+        out["confidence_notes"] = notes
+    return out
+
+
+def _clean_clip_summary_style(text: str) -> str:
+    """Remove common VLM meta-intros so summaries read like on-screen action."""
+    cleaned = str(text or "").strip()
+    replacements = [
+        ("The video features ", ""),
+        ("This video features ", ""),
+        ("The clip features ", ""),
+        ("This clip features ", ""),
+        ("The video shows ", ""),
+        ("This video shows ", ""),
+        ("The clip shows ", ""),
+        ("This clip shows ", ""),
+        ("The footage shows ", ""),
+        ("This footage shows ", ""),
+        ("The video contains ", ""),
+        ("This video contains ", ""),
+        ("The clip contains ", ""),
+        ("This clip contains ", ""),
+    ]
+    for prefix, replacement in replacements:
+        if cleaned.startswith(prefix):
+            cleaned = replacement + cleaned[len(prefix):]
+            break
+    if cleaned:
+        cleaned = cleaned[0].upper() + cleaned[1:]
+    return cleaned
+
+
+def _fallback_clip_summary(
+    clip_name: str,
+    fps: float,
+    duration_frames: int,
+    keyframes: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    duration = round(duration_frames / fps, 2) if fps else None
+    descriptions = [str(item.get("description") or "").strip() for item in keyframes if item.get("description")]
+    keywords = []
+    for item in keyframes:
+        keywords.extend(str(keyword) for keyword in (item.get("keywords") or []) if keyword)
+    moments = [
+        {
+            "time_seconds": _safe_number(item.get("time_seconds"), 0.0),
+            "frame": int(_safe_number(item.get("frame"), 0)),
+            "moment": str(item.get("description") or "").strip(),
+            "why_it_matters": str(item.get("story_note") or "").strip(),
+        }
+        for item in keyframes
+        if item.get("story_beat") or item.get("story_note")
+    ][:12]
+    summary = " / ".join(descriptions[:5]) if descriptions else "No VLM keyframe descriptions were generated."
+    return {
+        "clip_summary": summary,
+        "visual_timeline": _fallback_visual_timeline(keyframes),
+        "important_moments": moments,
+        "editorial_opportunities": [
+            "Use gesture peaks and open-hand moments for punch-ins or angle changes.",
+            "Use wide/interior frames as context or reset moments when they appear.",
+        ],
+        "search_keywords": sorted({keyword for keyword in keywords if keyword and keyword != "unknown"})[:40],
+        "confidence_notes": f"Fallback summary from {len(keyframes)} sampled keyframes"
+        + (f" over {duration}s" if duration is not None else "")
+        + (f" for {clip_name}." if clip_name else "."),
+    }
+
+
+def _fallback_visual_timeline(keyframes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not keyframes:
+        return []
+    ordered = sorted(keyframes, key=lambda item: _safe_number(item.get("time_seconds"), 0.0))
+    chunk_count = min(6, max(1, len(ordered)))
+    timeline = []
+    for index in range(chunk_count):
+        start_i = int(round(index * len(ordered) / chunk_count))
+        end_i = int(round((index + 1) * len(ordered) / chunk_count))
+        chunk = ordered[start_i:max(start_i + 1, end_i)]
+        start = _safe_number(chunk[0].get("time_seconds"), 0.0)
+        end = _safe_number(chunk[-1].get("time_seconds"), start)
+        descriptions = [str(item.get("description") or "").strip() for item in chunk if item.get("description")]
+        timeline.append({
+            "start_seconds": start,
+            "end_seconds": end,
+            "summary": " / ".join(descriptions[:3]) if descriptions else "Sampled visual beat.",
+            "editorial_value": "Context for pacing, continuity, gesture timing, and summary search.",
+        })
+    return timeline
+
+
+def _safe_number(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
 
 
 def _load_qwen_vlm(model_name: str):
@@ -908,7 +1312,27 @@ def _generate_qwen_response(model: Any, processor: Any, image: Any, prompt: str)
     except Exception:
         pass
     with torch.no_grad():
-        generated_ids = model.generate(**inputs, max_new_tokens=220)
+        generated_ids = model.generate(**inputs, max_new_tokens=420)
+    trimmed = [
+        output_ids[len(input_ids):]
+        for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    return processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+
+
+def _generate_qwen_text_response(model: Any, processor: Any, prompt: str, *, max_new_tokens: int = 900) -> str:
+    import torch  # type: ignore
+
+    messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[text], padding=True, return_tensors="pt")
+    device = _model_device(model)
+    try:
+        inputs = inputs.to(device)
+    except Exception:
+        pass
+    with torch.no_grad():
+        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
     trimmed = [
         output_ids[len(input_ids):]
         for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
@@ -975,13 +1399,44 @@ def _generate_ollama_response(model_name: str, image: Any, prompt: str) -> str:
         "options": {
             "temperature": 0,
             "num_ctx": _ollama_num_ctx(),
-            "num_predict": 220,
+            "num_predict": 420,
         },
     }
     data = json.dumps(payload).encode("utf-8")
     endpoint = f"{_ollama_host()}/api/generate"
     request = urlrequest.Request(endpoint, data=data, headers={"Content-Type": "application/json"}, method="POST")
     timeout = float(os.environ.get("RESOLVE_MCP_OLLAMA_TIMEOUT", "180") or 180)
+    try:
+        with urlrequest.urlopen(request, timeout=timeout) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urlerror.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Ollama request failed with HTTP {exc.code}: {detail}") from exc
+    except urlerror.URLError as exc:
+        raise RuntimeError(f"Ollama is not reachable at {_ollama_host()}: {exc.reason}") from exc
+    message = result.get("message") if isinstance(result.get("message"), dict) else {}
+    return str(result.get("response") or message.get("content") or result.get("thinking") or "")
+
+
+def _generate_ollama_text_response(model_name: str, prompt: str, schema: Dict[str, Any], *, max_tokens: int = 900) -> str:
+    model = _ollama_model_name(model_name)
+    if not model:
+        raise RuntimeError(f"Ollama model must be provided as ollama:<model>, for example {DEFAULT_OLLAMA_VLM_MODEL}")
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "format": schema,
+        "options": {
+            "temperature": 0,
+            "num_ctx": max(_ollama_num_ctx(), 8192),
+            "num_predict": int(max_tokens or 900),
+        },
+    }
+    data = json.dumps(payload).encode("utf-8")
+    endpoint = f"{_ollama_host()}/api/generate"
+    request = urlrequest.Request(endpoint, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    timeout = float(os.environ.get("RESOLVE_MCP_OLLAMA_TIMEOUT", "240") or 240)
     try:
         with urlrequest.urlopen(request, timeout=timeout) as response:
             result = json.loads(response.read().decode("utf-8"))
@@ -1008,6 +1463,97 @@ def _vlm_prompt(frame: int, fps: float, rollup: Dict[str, Any], camera: Dict[str
         "camera_context; use those only as context for judging the image.\n"
         f"Frame: {frame}; seconds: {seconds}; dense_rollup: {json.dumps(rollup, sort_keys=True)}; "
         f"camera_context: {json.dumps(camera_context, sort_keys=True)}"
+    )
+
+
+def _vlm_clip_summary_prompt(
+    *,
+    clip_name: str,
+    fps: float,
+    duration_frames: int,
+    keyframes: List[Dict[str, Any]],
+    rollup: Dict[str, Any],
+    camera: Dict[str, Any],
+) -> str:
+    duration = round(duration_frames / fps, 2) if fps else None
+    observations = []
+    for item in sorted(keyframes, key=lambda entry: _safe_number(entry.get("time_seconds"), 0.0)):
+        observations.append({
+            "time_seconds": item.get("time_seconds"),
+            "frame": item.get("frame"),
+            "shot_type": item.get("shot_type"),
+            "description": item.get("description"),
+            "story_beat": item.get("story_beat"),
+            "story_note": item.get("story_note"),
+            "keywords": (item.get("keywords") or [])[:6],
+            "tone": item.get("tone"),
+        })
+    return (
+        "You are an expert documentary and social-video assistant editor. "
+        "You are given timestamped VLM observations sampled across one source clip. "
+        "Your job is to produce a detailed whole-clip visual understanding that helps a human editor "
+        "quickly know what is happening on screen and helps an AI editor make better cut decisions. "
+        "Do not invent facts that are not visible in the observations. If a detail is uncertain, say so in confidence_notes. "
+        "Be specific about visible actions, setting changes, gestures, facial expressions, camera framing, and useful B-roll/context moments. "
+        "Write in direct present-tense visual language. Describe the subject and action first. "
+        "Avoid meta phrasing such as 'the video features', 'the clip contains', 'a series of shots', "
+        "'the footage shows', or 'throughout the sequence'. "
+        "Good style: 'A man speaks directly to camera in a bright indoor atrium, gesturing with both hands as he explains his point.' "
+        "Bad style: 'The video features a series of wide shots within an indoor atrium.' "
+        "Group repeated talking-head frames into timeline ranges instead of listing every repeated frame. "
+        "Call out moments that may be useful for editing: strong gestures, smiles/reactions, prep actions, wide establishing shots, "
+        "walk-throughs, resets, and places that might work as cutaways or transitions. "
+        "Return exactly one complete JSON object with these keys: clip_summary, visual_timeline, important_moments, "
+        "editorial_opportunities, search_keywords, confidence_notes. "
+        "Do not use markdown fences. Do not include any text outside the JSON object. "
+        "clip_summary should be one rich 5-8 sentence paragraph about what happens, not a terse caption and not a report about the video file. "
+        "visual_timeline must contain 4-6 chronological segments with start_seconds, end_seconds, summary, editorial_value. "
+        "important_moments must contain the best 5-8 specific moments with time_seconds, frame, moment, why_it_matters. "
+        "editorial_opportunities should be 4-8 concrete edit-use suggestions, not generic advice. "
+        "search_keywords should be 12-24 short searchable tags. "
+        "Keep the JSON compact enough to finish completely. "
+        f"Clip name: {clip_name or 'unknown'}; fps: {fps}; duration_frames: {duration_frames}; duration_seconds: {duration}. "
+        f"Dense rollup: {json.dumps(rollup, sort_keys=True)}. "
+        f"Camera motion context: {json.dumps(camera, sort_keys=True)[:4000]}. "
+        f"Timestamped observations: {json.dumps(observations, sort_keys=True)}"
+    )
+
+
+def _vlm_section_summary_prompt(
+    *,
+    clip_name: str,
+    fps: float,
+    duration_frames: int,
+    sections: List[Dict[str, Any]],
+    rollup: Dict[str, Any],
+) -> str:
+    duration = round(duration_frames / fps, 2) if fps else None
+    compact_sections = []
+    for item in sections:
+        compact_sections.append(
+            {
+                "start_seconds": item.get("start_seconds"),
+                "end_seconds": item.get("end_seconds"),
+                "summary": item.get("clip_summary"),
+                "moments": (item.get("important_moments") or [])[:5],
+                "keywords": (item.get("search_keywords") or [])[:10],
+            }
+        )
+    return (
+        "You are an expert documentary and social-video assistant editor. "
+        "You are given section summaries from one long source clip. Create a whole-clip visual map "
+        "that preserves what happens across the beginning, middle, and end. "
+        "Write in direct present-tense visual language about what is happening on screen. "
+        "Avoid meta phrasing such as 'the video features', 'the clip contains', or 'a series of shots'. "
+        "Do not invent details beyond the section summaries. "
+        "Return exactly one complete JSON object with these keys: clip_summary, visual_timeline, important_moments, "
+        "editorial_opportunities, search_keywords, confidence_notes. Do not use markdown fences. "
+        "clip_summary should be a rich 5-8 sentence paragraph that explains the full arc of visible action. "
+        "visual_timeline should contain 6-10 chronological segments covering the whole clip. "
+        "important_moments should contain the best 6-10 specific moments. "
+        f"Clip name: {clip_name or 'unknown'}; fps: {fps}; duration_frames: {duration_frames}; duration_seconds: {duration}. "
+        f"Dense rollup: {json.dumps(rollup, sort_keys=True)}. "
+        f"Section summaries: {json.dumps(compact_sections, sort_keys=True)}"
     )
 
 
@@ -1066,3 +1612,20 @@ def _parse_vlm_json(raw: str) -> Dict[str, Any]:
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
         return {}
+
+
+def _extract_json_string_field(raw: str, field: str) -> str:
+    match = re.search(rf'"{re.escape(field)}"\s*:\s*"((?:\\.|[^"\\])*)"', raw or "", flags=re.DOTALL)
+    if not match:
+        return ""
+    try:
+        return json.loads('"' + match.group(1) + '"')
+    except Exception:
+        return match.group(1).replace('\\"', '"').strip()
+
+
+def _clean_vlm_text(raw: str) -> str:
+    text = (raw or "").strip()
+    text = re.sub(r"^```(?:json)?", "", text).strip()
+    text = re.sub(r"```$", "", text).strip()
+    return text[:500]

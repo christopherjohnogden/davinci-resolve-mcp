@@ -1,0 +1,67 @@
+# torch >= 2.4 + CUDA 12.x is required: modern transformers (Qwen2.5-VL deep tier)
+# refuses to enable PyTorch on torch 2.1. This base ships torch 2.7.1 / CUDA 12.6.3.
+FROM runpod/pytorch:0.7.0-cu1263-torch271-ubuntu2204
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY . /app
+
+RUN python -m pip install --upgrade pip && \
+    python -m pip install \
+      runpod \
+      numpy \
+      opencv-python-headless \
+      ultralytics \
+      boto3 \
+      requests \
+      transformers \
+      accelerate \
+      qwen-vl-utils \
+      hsemotion
+
+# Bake YOLO weights into the image so cold starts never re-download them from
+# GitHub at runtime. resolve_pose_model_path() searches the repo root (/app),
+# so placing the .pt files here makes them resolve locally on every worker boot.
+# These ship inside the image layer that RunPod caches, so even a fresh host
+# gets the weights in the same image pull — no separate download step.
+RUN cd /app && \
+    python -c "from ultralytics import YOLO; YOLO('yolo11n.pt'); YOLO('yolo11n-pose.pt')" && \
+    ls -lh /app/yolo11n.pt /app/yolo11n-pose.pt
+
+# Fail the build (not the runtime) if transformers can't enable PyTorch or load the
+# Qwen2.5-VL class — this is the exact breakage the torch 2.1 base caused.
+RUN python -c "import torch; assert torch.__version__ >= '2.4', torch.__version__; \
+import transformers; from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor; \
+print('transformers', transformers.__version__, 'torch', torch.__version__, 'Qwen2.5-VL import OK')"
+
+# Expression scoring is optional at runtime, but if we intend to expose it from
+# the RunPod worker the import should fail at build time rather than silently
+# downgrading every job.
+RUN python -c "from hsemotion.facial_emotions import HSEmotionRecognizer; print('hsemotion import OK')"
+
+# Fail the build if the worker entrypoint can't import the way RunPod launches it.
+# Running it as a script puts /app/examples on sys.path (NOT /app), so `from src...`
+# only resolves with PYTHONPATH=/app — exactly the crash-loop bug this guards against.
+RUN cd / && python -c "import examples.runpod_visual_worker; print('worker entrypoint import OK')" 2>/dev/null \
+    || (cd /app && python -c "import sys; sys.path.insert(0,'/app'); import examples.runpod_visual_worker; print('worker entrypoint import OK (via PYTHONPATH)')")
+
+# Persist model caches on the attached network volume so they survive scale-to-zero.
+# YOLO config/cache (tiny; weights are baked above, this is belt-and-suspenders).
+# HuggingFace caches hold the ~16GB Qwen2.5-VL weights for the deep tier: they
+# download once to the volume, then every future cold start reads them from the
+# attached volume instead of re-downloading. We deliberately do NOT bake the VLM
+# weights into the image (it would bloat the image to ~23GB+ and slow every pull).
+ENV YOLO_CONFIG_DIR=/runpod-volume/ultralytics \
+    HF_HOME=/runpod-volume/hf \
+    TRANSFORMERS_CACHE=/runpod-volume/hf \
+    HF_HUB_CACHE=/runpod-volume/hf/hub
+
+CMD ["python", "-u", "examples/runpod_visual_worker.py"]

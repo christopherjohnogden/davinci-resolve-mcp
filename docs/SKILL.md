@@ -470,6 +470,31 @@ source duration, with each time bucket preferring its strongest local
 action/expression frame.
 Fast tier is the default production path.
 
+Remote GPU visual analysis is opt-in with `analysis_backend="runpod"`; leaving
+the parameter unset keeps the local path. Configure `RUNPOD_ANALYSIS_ENDPOINT_ID`
+and `RUNPOD_API_KEY`. Prefer `RUNPOD_NETWORK_VOLUME_ID` plus datacenter/endpoint
+and RunPod S3 credentials so the MCP stages source-safe copies to the network
+volume and the worker reads them from `/runpod-volume`. If no network volume is
+configured, provide either `runpod_file_url` for the clip or a
+`RUNPOD_MEDIA_LOCAL_PREFIX` / `RUNPOD_MEDIA_URL_PREFIX` mapping so the RunPod
+worker can read a temporary source copy or approved analysis URL. Use
+`runpod_wait=false` to submit quickly and let RunPod scale multiple workers; then
+poll/commit completed jobs with
+`media_analysis(action="runpod_visual_status", params={clip_id, job_id})`. Only
+the sidecar JSON and metadata rollup come back; Resolve metadata writeback still
+happens locally.
+For ingest batches, use
+`media_analysis(action="runpod_visual_submit_batch", params={clip_ids:[...]})`;
+it submits all clips without waiting, then returns one `runpod_job_id` per clip.
+The matching serverless worker entrypoint is
+`examples/runpod_visual_worker.py`.
+For local configuration, the server auto-loads repo-local `.env` and `.env.local`
+files; shell exports and MCP client env blocks still win. `RESOLVE_MCP_ENV_FILE`
+can point at a different env file.
+Staged media defaults to a 14-day retention target with
+`RUNPOD_STAGING_RETENTION_DAYS=14`. The value is included in RunPod job input,
+but the staging backend must enforce deletion through lifecycle rules or cleanup.
+
 **`analyze_clip_transcript` / `get_transcript`** — Local Parakeet transcript sidecars.
 
 `analyze_clip_transcript(clip_id, force=false, model="mlx-community/parakeet-tdt-0.6b-v3",

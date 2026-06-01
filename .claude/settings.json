@@ -17,7 +17,25 @@
       "Bash(git log *)",
       "Bash(git status *)",
       "Bash(ls apps/resolve-chat-panel/node_modules/.bin)",
-      "Bash(grep -m1 '\"name\"' apps/resolve-chat-panel/node_modules/.package-lock.json)"
+      "Bash(grep -m1 '\"name\"' apps/resolve-chat-panel/node_modules/.package-lock.json)",
+      "Bash(claude mcp *)",
+      "mcp__runpod__list-network-volumes",
+      "mcp__runpod__list-endpoints",
+      "Bash(command -v docker)",
+      "Bash(docker info *)",
+      "Bash(exit 0)",
+      "Bash(docker image *)",
+      "Bash(docker manifest *)",
+      "mcp__runpod__list-templates",
+      "mcp__runpod__get-endpoint",
+      "mcp__runpod__update-template",
+      "Bash(grep -vE \"^\\\\s*$|RUN|#\")",
+      "mcp__runpod__list-pods",
+      "mcp__runpod__create-network-volume",
+      "mcp__runpod__delete-network-volume",
+      "mcp__runpod__delete-endpoint",
+      "Bash(docker run --rm --platform linux/amd64 --entrypoint bash docker.io/cjo9224/resolve-mcp-worker:latest -lc ' *)",
+      "mcp__runpod__update-endpoint"
     ]
   }
 }

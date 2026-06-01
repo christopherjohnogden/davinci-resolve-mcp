@@ -1,0 +1,33 @@
+# Keep the RunPod worker image lean and free of secrets.
+# COPY . /app would otherwise pull in the venv, git history, and local env files.
+
+# Virtual environments / caches
+venv/
+.venv/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Version control
+.git/
+.gitignore
+
+# Secrets and local config (NEVER bake into the image)
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Node / editor noise
+node_modules/
+.vscode/
+.idea/
+.DS_Store
+
+# Build artifacts / docs not needed at runtime
+dist/
+build/
+*.egg-info/

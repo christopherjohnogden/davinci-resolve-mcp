@@ -1252,6 +1252,17 @@ TOOL_INSTALL: Dict[str, Dict[str, Any]] = {
         "requires": "apple_silicon",
         "notes": "Apple Silicon only. Choose this OR whisper_cli OR whisper_cpp.",
     },
+    "parakeet_mlx": {
+        "label": "parakeet-mlx",
+        "bundle": "transcription",
+        "required_for": ["source-frame transcript sidecars via analyze_clip_transcript"],
+        "commands": {
+            "macos_apple_silicon": "pip install parakeet-mlx",
+        },
+        "verify": "python -c 'import parakeet_mlx'",
+        "requires": "apple_silicon",
+        "notes": "Preferred assistant-editor transcription backend. Writes source-frame transcript sidecars; external transcripts do not populate Resolve's native transcription panel.",
+    },
     "opencv": {
         "label": "opencv-python",
         "required_for": ["optical-flow motion scoring (optional)"],
@@ -1371,6 +1382,7 @@ def detect_capabilities(env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     # openai-whisper Python CLI invoked as `whisper`.)
     whisper_cpp = shutil.which("whisper-cli") or shutil.which("whisper-cpp")
     mlx_whisper = importlib.util.find_spec("mlx_whisper") is not None
+    parakeet_mlx = importlib.util.find_spec("parakeet_mlx") is not None
     cv2 = importlib.util.find_spec("cv2") is not None
     provider = env.get("DAVINCI_RESOLVE_MCP_VISION_PROVIDER")
 
@@ -1397,18 +1409,27 @@ def detect_capabilities(env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
             "whisper_cli": _tool_entry("whisper_cli", bool(whisper_cli), {"path": whisper_cli}),
             "whisper_cpp": _tool_entry("whisper_cpp", bool(whisper_cpp), {"path": whisper_cpp}),
             "mlx_whisper": _tool_entry("mlx_whisper", bool(mlx_whisper), {"python_module": "mlx_whisper"}),
+            "parakeet_mlx": _tool_entry("parakeet_mlx", bool(parakeet_mlx), {"python_module": "parakeet_mlx"}),
             "opencv": _tool_entry("opencv", bool(cv2), {"python_module": "cv2"}),
         },
         "transcription": {
-            "available": bool(whisper_cli or whisper_cpp or mlx_whisper),
+            "available": bool(parakeet_mlx or whisper_cli or whisper_cpp or mlx_whisper),
+            "preferred_backend": "parakeet_mlx" if parakeet_mlx else None,
+            "preferred_action": "media_analysis(action='analyze_clip_transcript')",
             "backends": [
                 name for name, available in (
+                    ("parakeet_mlx", bool(parakeet_mlx)),
                     ("whisper_cli", bool(whisper_cli)),
                     ("whisper_cpp", bool(whisper_cpp)),
                     ("mlx_whisper", bool(mlx_whisper)),
                 )
                 if available
             ],
+            "notes": (
+                "For the assistant-editor pipeline, prefer analyze_clip_transcript, "
+                "which uses Parakeet/MLX when installed and writes source-frame sidecars. "
+                "Legacy media-analysis transcription backends are reported separately."
+            ),
         },
         "vision": {
             "available": True,

@@ -537,6 +537,84 @@ chat/sampling model. It is intentionally single-user and local; it does not
 provide authentication, multi-user locking, media playback, or image storage in
 SQLite.
 
+### Optional RunPod Visual Backend
+
+Local visual analysis remains the default. For project-ingest batches that need
+remote GPUs, call `analyze_clip_visual` with `analysis_backend="runpod"` or route
+through `media_analysis(action="analyze_clip_visual", params={...})` with the same
+parameter. The RunPod path uses the same sampling/model settings as local
+analysis and writes the returned sidecar plus Resolve metadata locally after the
+job completes.
+
+Configure:
+
+- `RUNPOD_ANALYSIS_ENDPOINT_ID`: the RunPod Serverless endpoint id.
+- `RUNPOD_API_KEY`: the API key used by the local MCP to submit and poll jobs.
+- `RUNPOD_NETWORK_VOLUME_ID`: preferred staging path. The MCP uploads a
+  source-safe copy to this RunPod network volume through the S3-compatible API,
+  then the worker reads it from `/runpod-volume`.
+- `RUNPOD_NETWORK_VOLUME_DATACENTER_ID`: the volume datacenter, such as
+  `US-NC-1`.
+- `RUNPOD_NETWORK_VOLUME_ENDPOINT_URL`: optional explicit S3 endpoint, such as
+  `https://s3api-us-nc-1.runpod.io`.
+- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`: RunPod S3 API credentials for
+  the network-volume upload. `RUNPOD_S3_ACCESS_KEY_ID` /
+  `RUNPOD_S3_SECRET_ACCESS_KEY` are accepted aliases.
+- `RUNPOD_VOLUME_REMOTE_PREFIX`: optional folder prefix on the volume; defaults
+  to `resolve-mcp-staging`.
+- `RUNPOD_VOLUME_MOUNT_PATH`: worker mount path; defaults to `/runpod-volume`.
+- `runpod_file_url`: a signed URL for the clip, or
+  `RUNPOD_MEDIA_LOCAL_PREFIX` + `RUNPOD_MEDIA_URL_PREFIX` to map local source
+  paths to already-staged URLs when not using a network volume.
+- `RUNPOD_STAGING_RETENTION_DAYS`: retention target for staged media copies;
+  defaults to `14`.
+
+The server auto-loads repo-local `.env` and `.env.local` files, so these values
+can live there instead of being exported in every shell. Existing shell exports
+and MCP client env blocks take priority; set `RESOLVE_MCP_ENV_FILE` to load a
+specific file from another location.
+
+The retention value is carried in each RunPod job input so the staging system can
+make the policy visible. Actual deletion still belongs to the storage backend:
+use an object-storage lifecycle rule, or a scheduled cleanup job for a RunPod
+network volume. Deleting staged files limits growth; deleting the network volume
+is what stops billing for that allocated volume.
+
+When `RUNPOD_NETWORK_VOLUME_ID` is set, the MCP skips the URL-prefix mapping and
+stages each clip to:
+
+```text
+s3://<RUNPOD_NETWORK_VOLUME_ID>/<RUNPOD_VOLUME_REMOTE_PREFIX>/<project>/<media_id>/<filename>
+```
+
+The matching worker path is:
+
+```text
+/runpod-volume/<RUNPOD_VOLUME_REMOTE_PREFIX>/<project>/<media_id>/<filename>
+```
+
+To test staging without running analysis, call
+`media_analysis(action="runpod_stage_clip", params={"clip_id": "...",
+"dry_run": true})`; set `dry_run=false` to upload the source-safe copy.
+
+Use `runpod_wait=false` to submit many clips quickly. Each response includes a
+`runpod_job_id`; later call
+`media_analysis(action="runpod_visual_status", params={"clip_id": "...",
+"job_id": "..."})` to poll and commit completed output. The remote worker should
+return either `visual_sidecar` inline or `visual_sidecar_url`; no source-media
+modification happens on the local machine.
+
+For multi-GPU project ingest, call
+`media_analysis(action="runpod_visual_submit_batch", params={"clip_ids": [...]})`.
+The MCP submits one job per clip without waiting; RunPod's endpoint scaling then
+fans those jobs out across available workers. Poll and commit the returned job ids
+as they complete.
+
+The companion worker entrypoint is `examples/runpod_visual_worker.py`. Build it
+into a RunPod image with the repo plus FFmpeg, `numpy`, `opencv-python`, and
+`ultralytics`; optional expression/VLM dependencies can be baked or cached in the
+same image.
+
 ### Mapping Resolve Metadata Fields
 
 Use `media_pool(action="metadata_field_inventory")` before expanding metadata

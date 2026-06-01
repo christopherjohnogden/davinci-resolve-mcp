@@ -12,7 +12,7 @@ Usage:
     python src/server.py --full       # Start the 330-tool granular server instead
 """
 
-VERSION = "2.30.9"
+VERSION = "2.30.11"
 
 import base64
 import os
@@ -42,6 +42,10 @@ for p in [current_dir, project_dir]:
         sys.path.insert(0, p)
 
 # Platform-specific Resolve paths
+from src.utils.env_loader import load_local_env
+
+load_local_env()
+
 from src.utils.cdl import normalize_cdl_payload
 from src.utils.mcp_stdio import run_fastmcp_stdio
 from src.utils.update_check import (
@@ -79,7 +83,11 @@ from src.utils.media_analysis import (
 from src.utils.motion_analysis import (
     POSE_METADATA_KEY,
     build_pose_pointer,
+    ffprobe_video_info,
+    motion_media_id,
+    motion_project_dir,
     motion_sidecar_path,
+    proxy_dimensions,
     read_motion_sidecar,
     run_yolo_pose_analysis,
     summarize_motion_events,
@@ -90,9 +98,27 @@ from src.utils.motion_analysis import (
 from src.utils.visual_analysis import (
     DEFAULT_OLLAMA_VLM_MODEL,
     VISUAL_METADATA_FIELDS,
+    _extract_keyframe_images,
+    _merge_vlm_metadata_rollup,
+    _select_vlm_keyframes,
+    adaptive_vlm_keyframe_count,
     read_visual_sidecar,
     run_clip_visual_analysis,
     visual_sidecar_path,
+)
+from src.utils.runpod_analysis import (
+    DEFAULT_RUNPOD_API_KEY_ENV,
+    RunPodConfigError,
+    RunPodJobError,
+    build_runpod_endpoint_base,
+    build_runpod_file_url,
+    build_runpod_visual_input,
+    extract_visual_payload_from_runpod,
+    get_runpod_job_status,
+    runpod_api_key,
+    stage_file_to_runpod_network_volume,
+    submit_runpod_job,
+    wait_for_runpod_job,
 )
 from src.utils.transcript_analysis import (
     DEFAULT_PARAKEET_MODEL,
@@ -104,6 +130,16 @@ from src.utils.transcript_analysis import (
     transcript_to_srt,
     transcript_keywords,
     write_transcript_srt,
+)
+from src.utils.edit_intelligence import (
+    ai_cut_plan_path,
+    apply_ai_cut_plan_preview,
+    build_transcript_embeddings,
+    plan_ai_cut_from_sidecars,
+    query_transcript_embeddings,
+    read_transcript_embeddings,
+    transcript_embeddings_path,
+    verify_ai_cut_plan_preview,
 )
 from src.utils.sync_detection import detect_sync_events_for_records as detect_media_sync_events
 from src.utils.media_analysis_jobs import (
@@ -14163,13 +14199,28 @@ def analyze_clip_visual(
     expression: bool = True,
     expression_every_n: int = 2,
     vlm_model: Optional[str] = DEFAULT_OLLAMA_VLM_MODEL,
-    vlm_max_keyframes: int = 12,
+    vlm_max_keyframes: int = 0,
+    analysis_backend: str = "local",
+    runpod_endpoint_id: Optional[str] = None,
+    runpod_endpoint_url: Optional[str] = None,
+    runpod_api_key_env: str = DEFAULT_RUNPOD_API_KEY_ENV,
+    runpod_file_url: Optional[str] = None,
+    runpod_local_prefix: Optional[str] = None,
+    runpod_url_prefix: Optional[str] = None,
+    runpod_wait: bool = True,
+    runpod_poll_interval: float = 2.0,
+    runpod_timeout: float = 30.0,
+    runpod_max_wait_seconds: float = 1800.0,
+    runpod_use_proxy: bool = False,
+    runpod_proxy_width: int = 960,
+    runpod_proxy_crf: int = 30,
 ) -> Dict[str, Any]:
     """Run source-safe visual analysis and cache a visual sidecar for one clip.
 
     Fast tier runs dense pose, object detection, shot size, camera motion, and
     optional expression analysis from one sampled decode loop. Deep tier is
-    reserved for opt-in local VLM enrichment.
+    reserved for opt-in local VLM enrichment. Set analysis_backend="runpod" to
+    submit the same analysis settings to a configured RunPod endpoint.
     """
     proj, clip, err = _motion_target_clip(clip_id)
     if err:
@@ -14193,6 +14244,48 @@ def analyze_clip_visual(
             "metadata_rollup": cached.get("metadata_rollup") or {},
             "metadata_writeback": metadata_result,
         }
+
+    backend = str(analysis_backend or "local").strip().lower()
+    if backend in {"runpod", "remote", "remote_runpod"}:
+        return _analyze_clip_visual_runpod(
+            clip=clip,
+            context=context,
+            sidecar=sidecar,
+            tier=tier,
+            sample_every_n=sample_every_n,
+            object_every_n=object_every_n,
+            object_every_seconds=object_every_seconds,
+            batch_size=batch_size,
+            proxy_width=proxy_width,
+            dry_run=dry_run,
+            write_metadata=write_metadata,
+            pose_model=pose_model,
+            object_model=object_model,
+            expression=bool(expression),
+            expression_every_n=expression_every_n,
+            vlm_model=vlm_model,
+            vlm_max_keyframes=vlm_max_keyframes,
+            runpod_endpoint_id=runpod_endpoint_id,
+            runpod_endpoint_url=runpod_endpoint_url,
+            runpod_api_key_env=runpod_api_key_env,
+            runpod_file_url=runpod_file_url,
+            runpod_local_prefix=runpod_local_prefix,
+            runpod_url_prefix=runpod_url_prefix,
+            runpod_wait=runpod_wait,
+            runpod_poll_interval=runpod_poll_interval,
+            runpod_timeout=runpod_timeout,
+            runpod_max_wait_seconds=runpod_max_wait_seconds,
+            runpod_use_proxy=runpod_use_proxy,
+            runpod_proxy_width=runpod_proxy_width,
+            runpod_proxy_crf=runpod_proxy_crf,
+        )
+    if backend not in {"local", "mcp", "default"}:
+        return _err(
+            f"Unsupported visual analysis backend: {analysis_backend}",
+            code="VISUAL_ANALYSIS_BACKEND_UNSUPPORTED",
+            category="validation",
+            details={"supported": ["local", "runpod"]},
+        )
 
     try:
         payload = run_clip_visual_analysis(
@@ -14239,6 +14332,860 @@ def analyze_clip_visual(
         "metadata_writeback": metadata_result,
         "models": payload.get("models") or {},
         "tier": payload.get("tier"),
+    }
+
+
+def _analyze_clip_visual_runpod(
+    *,
+    clip,
+    context: Dict[str, Any],
+    sidecar,
+    tier: str,
+    sample_every_n: int,
+    object_every_n: Optional[int],
+    object_every_seconds: float,
+    batch_size: int,
+    proxy_width: int,
+    dry_run: bool,
+    write_metadata: bool,
+    pose_model: str,
+    object_model: str,
+    expression: bool,
+    expression_every_n: int,
+    vlm_model: Optional[str],
+    vlm_max_keyframes: int,
+    runpod_endpoint_id: Optional[str],
+    runpod_endpoint_url: Optional[str],
+    runpod_api_key_env: str,
+    runpod_file_url: Optional[str],
+    runpod_local_prefix: Optional[str],
+    runpod_url_prefix: Optional[str],
+    runpod_wait: bool,
+    runpod_poll_interval: float,
+    runpod_timeout: float,
+    runpod_max_wait_seconds: float,
+    runpod_use_proxy: bool,
+    runpod_proxy_width: int,
+    runpod_proxy_crf: int,
+) -> Dict[str, Any]:
+    try:
+        endpoint_base = build_runpod_endpoint_base(runpod_endpoint_id, runpod_endpoint_url)
+        api_key_value: Optional[str] = None
+        staging: Optional[Dict[str, Any]] = None
+        upload_file_path = context["file_path"]
+        analysis_proxy: Optional[Dict[str, Any]] = None
+        if runpod_use_proxy and not runpod_file_url:
+            proxy_result = _ensure_runpod_analysis_proxy(
+                context,
+                width=int(runpod_proxy_width or 960),
+                crf=int(runpod_proxy_crf or 30),
+                dry_run=dry_run,
+            )
+            if not proxy_result.get("success"):
+                return {
+                    "analyzed": False,
+                    "analysis_backend": "runpod",
+                    "media_id": context["media_id"],
+                    "clip_name": context["clip_name"],
+                    "file_path": context["file_path"],
+                    "sidecar_path": str(sidecar),
+                    "error": proxy_result.get("error") or "Failed to create RunPod analysis proxy.",
+                    "note": "No partial visual sidecar was written.",
+                }
+            upload_file_path = str(proxy_result["proxy_path"])
+            analysis_proxy = proxy_result
+        if not runpod_file_url:
+            staging = stage_file_to_runpod_network_volume(
+                file_path=upload_file_path,
+                project_name=str(context.get("project_name") or "Project"),
+                media_id=str(context.get("media_id") or ""),
+                api_key_value=None,
+                api_key_env=runpod_api_key_env,
+                dry_run=dry_run,
+                timeout=float(runpod_timeout or 30.0),
+            )
+        if staging:
+            file_url = str(staging["file_url"])
+            staged_volume_path = str(staging["volume_path"])
+            network_volume_id = str(staging["network_volume_id"])
+            staging_object_key = str(staging["object_key"])
+        else:
+            file_url = build_runpod_file_url(
+                upload_file_path,
+                file_url=runpod_file_url,
+                local_prefix=runpod_local_prefix,
+                url_prefix=runpod_url_prefix,
+            )
+            staged_volume_path = None
+            network_volume_id = None
+            staging_object_key = None
+        job_input = build_runpod_visual_input(
+            file_url=file_url,
+            file_path=context["file_path"],
+            media_id=context["media_id"],
+            clip_name=context["clip_name"],
+            fps=context["fps"],
+            duration_frames=context["duration_frames"],
+            tier=tier,
+            sample_every_n=sample_every_n,
+            object_every_n=object_every_n,
+            object_every_seconds=object_every_seconds,
+            batch_size=batch_size,
+            proxy_width=proxy_width,
+            pose_model=pose_model,
+            object_model=object_model,
+            expression=expression,
+            expression_every_n=expression_every_n,
+            vlm_model=vlm_model,
+            vlm_max_keyframes=vlm_max_keyframes,
+            staged_volume_path=staged_volume_path,
+            network_volume_id=network_volume_id,
+            staging_object_key=staging_object_key,
+            analysis_proxy=analysis_proxy,
+        )
+        if dry_run:
+            return {
+                "analyzed": False,
+                "dry_run": True,
+                "analysis_backend": "runpod",
+                "would_submit": True,
+                "media_id": context["media_id"],
+                "clip_name": context["clip_name"],
+                "sidecar_path": str(sidecar),
+                "endpoint_base": endpoint_base,
+                "media_url_configured": True,
+                "analysis_proxy": _runpod_analysis_proxy_preview(analysis_proxy),
+                "staging": _runpod_staging_preview(staging),
+                "job_input_preview": _runpod_job_input_preview(job_input),
+            }
+        if not api_key_value:
+            api_key_value = runpod_api_key(api_key_env=runpod_api_key_env)
+        submitted = submit_runpod_job(
+            endpoint_base,
+            api_key_value,
+            job_input,
+            timeout=float(runpod_timeout or 30.0),
+        )
+        job_id = submitted.get("id") or submitted.get("job_id")
+        if not job_id:
+            raise RunPodJobError(f"RunPod submit returned no job id: {submitted}")
+        if not runpod_wait:
+            return {
+                "analyzed": "submitted",
+                "analysis_backend": "runpod",
+                "media_id": context["media_id"],
+                "clip_name": context["clip_name"],
+                "sidecar_path": str(sidecar),
+                "runpod_job_id": job_id,
+                "runpod_status": submitted.get("status"),
+                "staging": _runpod_staging_preview(staging),
+                "status_action": {
+                    "tool": "media_analysis",
+                    "action": "runpod_visual_status",
+                    "params": {
+                        "clip_id": context.get("clip_id"),
+                        "job_id": job_id,
+                        "write_metadata": write_metadata,
+                    },
+                },
+            }
+        status = wait_for_runpod_job(
+            endpoint_base,
+            api_key_value,
+            str(job_id),
+            poll_interval=float(runpod_poll_interval or 2.0),
+            max_wait_seconds=float(runpod_max_wait_seconds or 1800.0),
+            timeout=float(runpod_timeout or 30.0),
+        )
+        return _commit_runpod_visual_payload(
+            clip=clip,
+            context=context,
+            sidecar=sidecar,
+            status_payload=status,
+            api_key_value=api_key_value,
+            write_metadata=write_metadata,
+            dry_run=False,
+            runpod_timeout=float(runpod_timeout or 30.0),
+        )
+    except (RunPodConfigError, RunPodJobError, Exception) as exc:
+        return {
+            "analyzed": False,
+            "analysis_backend": "runpod",
+            "media_id": context["media_id"],
+            "clip_name": context["clip_name"],
+            "file_path": context["file_path"],
+            "sidecar_path": str(sidecar),
+            "error": str(exc),
+            "note": "No partial visual sidecar was written.",
+        }
+
+
+def _commit_runpod_visual_status(
+    *,
+    clip_id: str,
+    job_id: str,
+    wait: bool = False,
+    write_metadata: bool = True,
+    dry_run: bool = False,
+    runpod_endpoint_id: Optional[str] = None,
+    runpod_endpoint_url: Optional[str] = None,
+    runpod_api_key_env: str = DEFAULT_RUNPOD_API_KEY_ENV,
+    runpod_poll_interval: float = 2.0,
+    runpod_timeout: float = 30.0,
+    runpod_max_wait_seconds: float = 1800.0,
+) -> Dict[str, Any]:
+    proj, clip, err = _motion_target_clip(clip_id)
+    if err:
+        return err
+    context, context_err = _motion_clip_context(proj, clip)
+    if context_err:
+        return context_err
+    assert context is not None
+    sidecar = visual_sidecar_path(context["project_name"], context["media_id"])
+    try:
+        endpoint_base = build_runpod_endpoint_base(runpod_endpoint_id, runpod_endpoint_url)
+        api_key_value = runpod_api_key(api_key_env=runpod_api_key_env)
+        if wait:
+            status = wait_for_runpod_job(
+                endpoint_base,
+                api_key_value,
+                str(job_id),
+                poll_interval=float(runpod_poll_interval or 2.0),
+                max_wait_seconds=float(runpod_max_wait_seconds or 1800.0),
+                timeout=float(runpod_timeout or 30.0),
+            )
+        else:
+            status = get_runpod_job_status(
+                endpoint_base,
+                api_key_value,
+                str(job_id),
+                timeout=float(runpod_timeout or 30.0),
+            )
+        state = str(status.get("status") or "").upper()
+        if state != "COMPLETED":
+            return {
+                "analyzed": "pending" if state not in {"FAILED", "CANCELLED", "TIMED_OUT"} else False,
+                "analysis_backend": "runpod",
+                "media_id": context["media_id"],
+                "clip_name": context["clip_name"],
+                "sidecar_path": str(sidecar),
+                "runpod_job_id": job_id,
+                "runpod_status": status.get("status"),
+                "runpod_status_payload": status,
+            }
+        return _commit_runpod_visual_payload(
+            clip=clip,
+            context=context,
+            sidecar=sidecar,
+            status_payload=status,
+            api_key_value=api_key_value,
+            write_metadata=write_metadata,
+            dry_run=dry_run,
+            runpod_timeout=float(runpod_timeout or 30.0),
+        )
+    except (RunPodConfigError, RunPodJobError, Exception) as exc:
+        return {
+            "analyzed": False,
+            "analysis_backend": "runpod",
+            "media_id": context["media_id"],
+            "clip_name": context["clip_name"],
+            "sidecar_path": str(sidecar),
+            "runpod_job_id": job_id,
+            "error": str(exc),
+            "note": "No partial visual sidecar was written.",
+        }
+
+
+def _commit_runpod_visual_payload(
+    *,
+    clip,
+    context: Dict[str, Any],
+    sidecar,
+    status_payload: Dict[str, Any],
+    api_key_value: str,
+    write_metadata: bool,
+    dry_run: bool,
+    runpod_timeout: float,
+) -> Dict[str, Any]:
+    payload = extract_visual_payload_from_runpod(
+        status_payload,
+        expected_media_id=context["media_id"],
+        api_key_value=api_key_value,
+        timeout=float(runpod_timeout or 30.0),
+    )
+    if not dry_run:
+        write_json_atomic(sidecar, payload)
+    metadata_result = None
+    if write_metadata:
+        metadata_result = _write_visual_metadata(clip, payload.get("metadata_rollup") or {}, dry_run=dry_run)
+    return {
+        "analyzed": True,
+        "analysis_backend": "runpod",
+        "media_id": context["media_id"],
+        "sidecar_path": str(sidecar),
+        "event_count": len(payload.get("events") or []),
+        "events_summary": summarize_motion_events(payload.get("events") or []),
+        "metadata_rollup": payload.get("metadata_rollup") or {},
+        "metadata_writeback": metadata_result,
+        "models": payload.get("models") or {},
+        "tier": payload.get("tier"),
+        "runpod_job_id": status_payload.get("id") or status_payload.get("job_id"),
+        "runpod_status": status_payload.get("status"),
+        "dry_run": bool(dry_run),
+    }
+
+
+def _submit_runpod_vlm_keyframes(
+    *,
+    clip_id: str,
+    vlm_model: Optional[str],
+    max_keyframes: int = 0,
+    image_width: int = 1920,
+    runpod_proxy_width: int = 1920,
+    runpod_proxy_crf: int = 30,
+    write_metadata: bool = True,
+    dry_run: bool = False,
+    runpod_endpoint_id: Optional[str] = None,
+    runpod_endpoint_url: Optional[str] = None,
+    runpod_api_key_env: str = DEFAULT_RUNPOD_API_KEY_ENV,
+    runpod_timeout: float = 30.0,
+) -> Dict[str, Any]:
+    """Submit only selected JPEG keyframes for the RunPod deep VLM pass.
+
+    This assumes a fast visual sidecar already exists. Dense CV still comes from
+    a proxy/video pass; the expensive VLM receives only selected still frames.
+    """
+
+    proj, clip, err = _motion_target_clip(clip_id)
+    if err:
+        return err
+    context, context_err = _motion_clip_context(proj, clip)
+    if context_err:
+        return context_err
+    assert context is not None
+    sidecar = visual_sidecar_path(context["project_name"], context["media_id"])
+    payload = read_visual_sidecar(sidecar, include_frames=False)
+    if payload is None:
+        return {
+            "analyzed": False,
+            "analysis_backend": "runpod",
+            "media_id": context["media_id"],
+            "clip_name": context["clip_name"],
+            "sidecar_path": str(sidecar),
+            "error": "No visual sidecar exists yet. Run the fast tier first.",
+            "next_action": "analyze_clip_visual(analysis_backend='runpod', tier='fast', runpod_use_proxy=true)",
+        }
+    model = str(vlm_model or "").strip()
+    if not model:
+        return {
+            "analyzed": False,
+            "analysis_backend": "runpod",
+            "media_id": context["media_id"],
+            "clip_name": context["clip_name"],
+            "sidecar_path": str(sidecar),
+            "error": "vlm_model is required for the RunPod keyframe VLM pass.",
+        }
+    effective_max_keyframes = int(max_keyframes or 0) or adaptive_vlm_keyframe_count(
+        context.get("duration_frames") or payload.get("duration_frames"),
+        context.get("fps") or payload.get("fps"),
+    )
+    keyframes = _visual_keyframes_for_deep_pass(
+        payload,
+        int(context.get("duration_frames") or 0),
+        effective_max_keyframes,
+    )
+    proxy_result = _ensure_runpod_analysis_proxy(
+        context,
+        width=int(runpod_proxy_width or image_width or 1920),
+        crf=int(runpod_proxy_crf or 30),
+        dry_run=dry_run,
+    )
+    if not proxy_result.get("success"):
+        return {
+            "analyzed": False,
+            "analysis_backend": "runpod",
+            "media_id": context["media_id"],
+            "clip_name": context["clip_name"],
+            "sidecar_path": str(sidecar),
+            "error": proxy_result.get("error") or "Failed to create/read RunPod analysis proxy.",
+        }
+    proxy_path = str(proxy_result["proxy_path"])
+    target_width = min(int(image_width or proxy_result.get("width") or 1920), int(proxy_result.get("width") or image_width or 1920))
+    target_width, target_height = proxy_dimensions(
+        int(proxy_result.get("width") or target_width),
+        int(proxy_result.get("height") or 0),
+        target_width,
+    )
+    frame_dir = motion_project_dir(context.get("project_name")) / "_runpod_keyframes" / motion_media_id(context.get("media_id"))
+    if dry_run:
+        return {
+            "analyzed": False,
+            "dry_run": True,
+            "analysis_backend": "runpod",
+            "would_submit": True,
+            "media_id": context["media_id"],
+            "clip_name": context["clip_name"],
+            "sidecar_path": str(sidecar),
+            "selected_frames": keyframes,
+            "frame_count": len(keyframes),
+            "adaptive_keyframe_count": effective_max_keyframes,
+            "frame_dir": str(frame_dir),
+            "analysis_proxy": _runpod_analysis_proxy_preview(proxy_result),
+            "image_size": {"width": target_width, "height": target_height},
+            "extraction_method": "ffmpeg_seek",
+            "job_type": "resolve_vlm_keyframes",
+        }
+
+    started = time.monotonic()
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    extracted = _extract_keyframe_jpegs_by_seek(
+        proxy_path,
+        keyframes,
+        frame_dir=frame_dir,
+        media_id=str(context.get("media_id") or ""),
+        fps=float(context.get("fps") or payload.get("fps") or 0.0),
+        width=target_width,
+        height=target_height,
+    )
+    extraction_method = "ffmpeg_seek"
+    if not extracted:
+        extraction_method = "ffmpeg_select_fallback"
+        images = _extract_keyframe_images(proxy_path, keyframes, target_width, target_height)
+        for frame, image in images:
+            image_path = frame_dir / f"{motion_media_id(context.get('media_id'))}_f{int(frame):08d}.jpg"
+            image.save(image_path, "JPEG", quality=90, optimize=True)
+            extracted.append((int(frame), image_path))
+    if not extracted:
+        return {
+            "analyzed": False,
+            "analysis_backend": "runpod",
+            "media_id": context["media_id"],
+            "clip_name": context["clip_name"],
+            "sidecar_path": str(sidecar),
+            "error": "No keyframe images could be extracted from the analysis proxy.",
+    }
+    staged_keyframes: List[Dict[str, Any]] = []
+    upload_bytes = 0
+    for frame, image_path in extracted:
+        upload_bytes += int(image_path.stat().st_size)
+        staged = stage_file_to_runpod_network_volume(
+            file_path=str(image_path),
+            project_name=str(context.get("project_name") or "Project"),
+            media_id=str(context.get("media_id") or ""),
+            api_key_env=runpod_api_key_env,
+            dry_run=False,
+            timeout=float(runpod_timeout or 30.0),
+        )
+        staged_keyframes.append(
+            {
+                "frame": int(frame),
+                "volume_path": str(staged["volume_path"]),
+                "object_key": str(staged["object_key"]),
+                "s3_uri": str(staged["s3_uri"]),
+                "size_bytes": int(image_path.stat().st_size),
+            }
+        )
+    endpoint_base = build_runpod_endpoint_base(runpod_endpoint_id, runpod_endpoint_url)
+    api_key_value = runpod_api_key(api_key_env=runpod_api_key_env)
+    job_input = {
+        "job_type": "resolve_vlm_keyframes",
+        "schema_version": 1,
+        "media": {
+            "media_id": str(context["media_id"]),
+            "clip_name": str(context["clip_name"]),
+            "source_file_path": str(context["file_path"]),
+            "fps": float(context.get("fps") or 0.0),
+            "duration_frames": int(context.get("duration_frames") or 0),
+            "keyframes": staged_keyframes,
+        },
+        "analysis": {
+            "vlm_model": model,
+            "vlm_max_keyframes": int(effective_max_keyframes),
+        },
+        "metadata_rollup": payload.get("metadata_rollup") or {},
+        "camera": payload.get("camera") or {},
+        "output": {"return_vlm": True},
+    }
+    submitted = submit_runpod_job(endpoint_base, api_key_value, job_input, timeout=float(runpod_timeout or 30.0))
+    job_id = submitted.get("id") or submitted.get("job_id")
+    if not job_id:
+        raise RunPodJobError(f"RunPod submit returned no job id: {submitted}")
+    return {
+        "analyzed": "submitted",
+        "analysis_backend": "runpod",
+        "mode": "vlm_keyframes",
+        "media_id": context["media_id"],
+        "clip_name": context["clip_name"],
+        "sidecar_path": str(sidecar),
+        "runpod_job_id": job_id,
+        "runpod_status": submitted.get("status"),
+        "selected_frames": keyframes,
+        "frame_count": len(staged_keyframes),
+        "adaptive_keyframe_count": effective_max_keyframes,
+        "uploaded_bytes": upload_bytes,
+        "prep_seconds": round(time.monotonic() - started, 3),
+        "extraction_method": extraction_method,
+        "analysis_proxy": _runpod_analysis_proxy_preview(proxy_result),
+        "status_action": {
+            "tool": "media_analysis",
+            "action": "runpod_visual_keyframes_status",
+            "params": {"clip_id": clip_id, "job_id": job_id, "write_metadata": write_metadata},
+        },
+    }
+
+
+def _visual_keyframes_for_deep_pass(payload: Dict[str, Any], duration_frames: int, max_keyframes: int) -> List[int]:
+    max_keyframes = max(1, int(max_keyframes or 24))
+    existing = []
+    for item in (payload.get("vlm") or {}).get("keyframes") or []:
+        if item.get("frame") is None:
+            continue
+        try:
+            existing.append(int(item["frame"]))
+        except Exception:
+            pass
+    if len(set(existing)) >= max_keyframes:
+        return sorted(dict.fromkeys(existing))[:max_keyframes]
+    expression_events = ((payload.get("expression") or {}).get("events") or [])
+    return _select_vlm_keyframes(
+        duration_frames=int(duration_frames or payload.get("duration_frames") or 0),
+        sample_every_n=int(payload.get("sampled_every_n_frames") or 10),
+        pose_events=list(payload.get("events") or []),
+        expression_events=list(expression_events),
+        camera=dict(payload.get("camera") or {}),
+        max_keyframes=max_keyframes,
+    )
+
+
+def _extract_keyframe_jpegs_by_seek(
+    file_path: str,
+    frames: List[int],
+    *,
+    frame_dir,
+    media_id: str,
+    fps: float,
+    width: int,
+    height: int,
+) -> List[Tuple[int, Any]]:
+    if not shutil.which("ffmpeg") or fps <= 0:
+        return []
+    extracted: List[Tuple[int, Any]] = []
+    media = motion_media_id(media_id)
+    for frame in sorted({max(0, int(value)) for value in frames}):
+        image_path = frame_dir / f"{media}_f{frame:08d}.jpg"
+        if image_path.exists() and image_path.stat().st_size > 0:
+            extracted.append((frame, image_path))
+            continue
+        seconds = frame / fps
+        tmp_fd, tmp_name = tempfile.mkstemp(prefix=f"{media}_f{frame:08d}_", suffix=".jpg", dir=str(frame_dir))
+        os.close(tmp_fd)
+        try:
+            cmd = [
+                "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                f"{seconds:.6f}",
+                "-i",
+                file_path,
+                "-frames:v",
+                "1",
+                "-vf",
+                f"scale={width}:{height}",
+                "-q:v",
+                "2",
+                tmp_name,
+            ]
+            proc = subprocess.run(cmd, text=True, capture_output=True, timeout=30)
+            if proc.returncode != 0 or not os.path.exists(tmp_name) or os.path.getsize(tmp_name) <= 0:
+                return []
+            os.replace(tmp_name, image_path)
+            extracted.append((frame, image_path))
+        except Exception:
+            return []
+        finally:
+            try:
+                if os.path.exists(tmp_name):
+                    os.remove(tmp_name)
+            except Exception:
+                pass
+    return extracted
+
+
+def _commit_runpod_vlm_keyframes_status(
+    *,
+    clip_id: str,
+    job_id: str,
+    wait: bool = False,
+    write_metadata: bool = True,
+    dry_run: bool = False,
+    runpod_endpoint_id: Optional[str] = None,
+    runpod_endpoint_url: Optional[str] = None,
+    runpod_api_key_env: str = DEFAULT_RUNPOD_API_KEY_ENV,
+    runpod_poll_interval: float = 2.0,
+    runpod_timeout: float = 30.0,
+    runpod_max_wait_seconds: float = 1800.0,
+) -> Dict[str, Any]:
+    proj, clip, err = _motion_target_clip(clip_id)
+    if err:
+        return err
+    context, context_err = _motion_clip_context(proj, clip)
+    if context_err:
+        return context_err
+    assert context is not None
+    sidecar = visual_sidecar_path(context["project_name"], context["media_id"])
+    try:
+        endpoint_base = build_runpod_endpoint_base(runpod_endpoint_id, runpod_endpoint_url)
+        api_key_value = runpod_api_key(api_key_env=runpod_api_key_env)
+        if wait:
+            status = wait_for_runpod_job(
+                endpoint_base,
+                api_key_value,
+                str(job_id),
+                poll_interval=float(runpod_poll_interval or 2.0),
+                max_wait_seconds=float(runpod_max_wait_seconds or 1800.0),
+                timeout=float(runpod_timeout or 30.0),
+            )
+        else:
+            status = get_runpod_job_status(endpoint_base, api_key_value, str(job_id), timeout=float(runpod_timeout or 30.0))
+        state = str(status.get("status") or "").upper()
+        if state != "COMPLETED":
+            return {
+                "analyzed": "pending" if state not in {"FAILED", "CANCELLED", "TIMED_OUT"} else False,
+                "analysis_backend": "runpod",
+                "mode": "vlm_keyframes",
+                "media_id": context["media_id"],
+                "clip_name": context["clip_name"],
+                "sidecar_path": str(sidecar),
+                "runpod_job_id": job_id,
+                "runpod_status": status.get("status"),
+                "runpod_status_payload": status,
+            }
+        output = status.get("output") if isinstance(status.get("output"), dict) else status
+        if output.get("error"):
+            return {
+                "analyzed": False,
+                "analysis_backend": "runpod",
+                "mode": "vlm_keyframes",
+                "media_id": context["media_id"],
+                "clip_name": context["clip_name"],
+                "sidecar_path": str(sidecar),
+                "runpod_job_id": job_id,
+                "runpod_status": status.get("status"),
+                "error": output.get("error"),
+            }
+        if not sidecar.exists():
+            return {
+                "analyzed": False,
+                "analysis_backend": "runpod",
+                "mode": "vlm_keyframes",
+                "media_id": context["media_id"],
+                "clip_name": context["clip_name"],
+                "sidecar_path": str(sidecar),
+                "error": "No existing visual sidecar to merge VLM keyframes into.",
+            }
+        with open(sidecar, "r", encoding="utf-8") as handle:
+            current = json.load(handle)
+        merged = dict(current)
+        merged["vlm"] = output.get("vlm") or {}
+        merged["metadata_rollup"] = output.get("metadata_rollup") or _merge_vlm_metadata_rollup(
+            dict(current.get("metadata_rollup") or {}),
+            merged["vlm"],
+        )
+        merged["tier"] = "deep"
+        merged["analysis_backend"] = output.get("analysis_backend") or {"name": "runpod_worker", "mode": "vlm_keyframes"}
+        if not dry_run:
+            write_json_atomic(sidecar, merged)
+        metadata_result = None
+        if write_metadata:
+            metadata_result = _write_visual_metadata(clip, merged.get("metadata_rollup") or {}, dry_run=dry_run)
+        return {
+            "analyzed": True,
+            "analysis_backend": "runpod",
+            "mode": "vlm_keyframes",
+            "media_id": context["media_id"],
+            "clip_name": context["clip_name"],
+            "sidecar_path": str(sidecar),
+            "runpod_job_id": job_id,
+            "runpod_status": status.get("status"),
+            "vlm": merged.get("vlm") or {},
+            "metadata_rollup": merged.get("metadata_rollup") or {},
+            "metadata_writeback": metadata_result,
+            "dry_run": bool(dry_run),
+        }
+    except (RunPodConfigError, RunPodJobError, Exception) as exc:
+        return {
+            "analyzed": False,
+            "analysis_backend": "runpod",
+            "mode": "vlm_keyframes",
+            "media_id": context["media_id"],
+            "clip_name": context["clip_name"],
+            "sidecar_path": str(sidecar),
+            "runpod_job_id": job_id,
+            "error": str(exc),
+        }
+
+
+def _runpod_job_input_preview(job_input: Dict[str, Any]) -> Dict[str, Any]:
+    preview = json.loads(json.dumps(job_input))
+    if isinstance(preview.get("media"), dict):
+        preview["media"]["file_url"] = "<configured>"
+    return preview
+
+
+def _runpod_staging_preview(staging: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not staging:
+        return None
+    return {
+        key: staging.get(key)
+        for key in (
+            "dry_run",
+            "uploaded",
+            "skipped",
+            "would_upload",
+            "network_volume_id",
+            "data_center_id",
+            "s3_endpoint_url",
+            "object_key",
+            "s3_uri",
+            "volume_path",
+            "size_bytes",
+        )
+        if key in staging
+    }
+
+
+def _runpod_analysis_proxy_preview(proxy: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not proxy:
+        return None
+    return {
+        key: proxy.get(key)
+        for key in (
+            "success",
+            "created",
+            "dry_run",
+            "proxy_path",
+            "source_file_path",
+            "width",
+            "height",
+            "crf",
+            "size_bytes",
+            "source_size_bytes",
+            "estimated_size_reduction",
+            "frame_mapping",
+        )
+        if key in proxy
+    }
+
+
+def _ensure_runpod_analysis_proxy(
+    context: Dict[str, Any],
+    *,
+    width: int,
+    crf: int,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Create a source-safe low-res proxy for RunPod analysis only.
+
+    The proxy is never relinked into Resolve. It lives beside sidecars under
+    ~/Resolve_Analysis and keeps one source frame per proxy frame so returned
+    frame numbers still map to the original clip.
+    """
+
+    source = os.path.abspath(os.path.expanduser(str(context.get("file_path") or "")))
+    if not source or not os.path.isfile(source):
+        return {"success": False, "error": f"Source media file not found: {source}"}
+    if not shutil.which("ffmpeg"):
+        return {"success": False, "error": "ffmpeg is required to create RunPod analysis proxies."}
+    try:
+        info = ffprobe_video_info(source)
+    except Exception as exc:
+        return {"success": False, "error": f"ffprobe failed for analysis proxy: {type(exc).__name__}: {exc}"}
+
+    source_width = int(info.get("width") or 0)
+    source_height = int(info.get("height") or 0)
+    target_width = min(max(64, int(width or 960)), source_width or int(width or 960))
+    target_width, target_height = proxy_dimensions(source_width, source_height, target_width)
+    crf_value = min(40, max(18, int(crf or 30)))
+    proxy_dir = motion_project_dir(context.get("project_name")) / "_runpod_proxies"
+    media = motion_media_id(context.get("media_id"))
+    proxy_path = proxy_dir / f"{media}_w{target_width}_crf{crf_value}.mp4"
+    source_size = os.path.getsize(source)
+
+    base = {
+        "success": True,
+        "source_file_path": source,
+        "proxy_path": str(proxy_path),
+        "width": target_width,
+        "height": target_height,
+        "crf": crf_value,
+        "source_size_bytes": source_size,
+        "frame_mapping": "one_proxy_frame_per_source_frame",
+    }
+    if proxy_path.exists() and proxy_path.stat().st_size > 0:
+        size = proxy_path.stat().st_size
+        return {
+            **base,
+            "created": False,
+            "size_bytes": size,
+            "estimated_size_reduction": round(1 - (size / source_size), 4) if source_size else None,
+        }
+    if dry_run:
+        return {**base, "created": False, "dry_run": True}
+
+    proxy_dir.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix=f"{media}_", suffix=".mp4", dir=str(proxy_dir))
+    os.close(tmp_fd)
+    try:
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            source,
+            "-map",
+            "0:v:0",
+            "-an",
+            "-vf",
+            f"scale={target_width}:{target_height}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            str(crf_value),
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            tmp_name,
+        ]
+        proc = subprocess.run(cmd, text=True, capture_output=True)
+        if proc.returncode != 0:
+            return {
+                "success": False,
+                "error": f"ffmpeg proxy encode failed: {(proc.stderr or proc.stdout).strip()[:500]}",
+                "source_file_path": source,
+                "proxy_path": str(proxy_path),
+            }
+        os.replace(tmp_name, proxy_path)
+    finally:
+        try:
+            if os.path.exists(tmp_name):
+                os.remove(tmp_name)
+        except Exception:
+            pass
+    size = proxy_path.stat().st_size
+    return {
+        **base,
+        "created": True,
+        "size_bytes": size,
+        "estimated_size_reduction": round(1 - (size / source_size), 4) if source_size else None,
     }
 
 
@@ -14445,6 +15392,235 @@ def get_transcript(clip_id: str, include_words: bool = True) -> Dict[str, Any]:
     return data
 
 
+def analyze_transcript_embeddings(
+    clip_id: str,
+    force: bool = False,
+    dimensions: int = 384,
+    window_lines: int = 1,
+) -> Dict[str, Any]:
+    """Build a cached semantic-search sidecar from source-frame transcript lines."""
+    proj, clip, err = _motion_target_clip(clip_id)
+    if err:
+        return err
+    context, context_err = _motion_clip_context(proj, clip)
+    if context_err:
+        return context_err
+    assert context is not None
+    transcript_path = transcript_sidecar_path(context["project_name"], context["media_id"])
+    transcript = read_transcript_sidecar(transcript_path, include_words=True)
+    if transcript is None:
+        return {
+            "analyzed": False,
+            "media_id": context["media_id"],
+            "clip_name": context["clip_name"],
+            "transcript_sidecar_path": str(transcript_path),
+            "error": "No transcript sidecar exists yet. Run analyze_clip_transcript first.",
+        }
+    sidecar = transcript_embeddings_path(context["project_name"], context["media_id"])
+    if sidecar.exists() and not force:
+        cached = read_transcript_embeddings(sidecar) or {}
+        return {
+            "analyzed": "cached",
+            "media_id": context["media_id"],
+            "clip_name": context["clip_name"],
+            "sidecar_path": str(sidecar),
+            "entry_count": cached.get("entry_count"),
+            "engine": cached.get("engine"),
+            "dimensions": cached.get("dimensions"),
+        }
+    payload = build_transcript_embeddings(
+        transcript,
+        media_id=str(context["media_id"]),
+        clip_id=str(clip_id),
+        clip_name=str(context["clip_name"]),
+        dimensions=int(dimensions or 384),
+        window_lines=int(window_lines or 1),
+    )
+    write_json_atomic(sidecar, payload)
+    return {
+        "analyzed": True,
+        "media_id": context["media_id"],
+        "clip_name": context["clip_name"],
+        "sidecar_path": str(sidecar),
+        "entry_count": payload.get("entry_count"),
+        "engine": payload.get("engine"),
+        "dimensions": payload.get("dimensions"),
+    }
+
+
+def query_transcript_semantic(
+    clip_ids: List[str],
+    query: str,
+    limit: int = 10,
+    auto_build: bool = True,
+) -> Dict[str, Any]:
+    """Search transcript embedding sidecars for meaning-ish matches."""
+    indexes: List[Dict[str, Any]] = []
+    missing: List[Dict[str, Any]] = []
+    for cid in clip_ids:
+        proj, clip, err = _motion_target_clip(cid)
+        if err:
+            missing.append({"clip_id": cid, "error": err.get("error", err)})
+            continue
+        context, context_err = _motion_clip_context(proj, clip)
+        if context_err:
+            missing.append({"clip_id": cid, "error": context_err.get("error", context_err)})
+            continue
+        assert context is not None
+        sidecar = transcript_embeddings_path(context["project_name"], context["media_id"])
+        payload = read_transcript_embeddings(sidecar)
+        if payload is None and auto_build:
+            built = analyze_transcript_embeddings(cid)
+            if built.get("analyzed") in {True, "cached"}:
+                payload = read_transcript_embeddings(sidecar)
+        if payload is None:
+            missing.append({"clip_id": cid, "media_id": context["media_id"], "sidecar_path": str(sidecar)})
+            continue
+        payload["clip_id"] = payload.get("clip_id") or cid
+        indexes.append(payload)
+    results = query_transcript_embeddings(indexes, query, limit=limit) if query else []
+    return {
+        "success": True,
+        "query": query,
+        "clip_count": len(clip_ids),
+        "indexed_clip_count": len(indexes),
+        "missing": missing,
+        "result_count": len(results),
+        "results": results,
+    }
+
+
+def _ai_cut_clip_payload(clip_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    proj, clip, err = _motion_target_clip(clip_id)
+    if err:
+        return None, err
+    context, context_err = _motion_clip_context(proj, clip)
+    if context_err:
+        return None, context_err
+    assert context is not None
+    transcript_path = transcript_sidecar_path(context["project_name"], context["media_id"])
+    visual_path = visual_sidecar_path(context["project_name"], context["media_id"])
+    embeddings_path = transcript_embeddings_path(context["project_name"], context["media_id"])
+    transcript = read_transcript_sidecar(transcript_path, include_words=False) or {}
+    visual = read_visual_sidecar(visual_path, include_frames=False) or {}
+    embeddings = read_transcript_embeddings(embeddings_path) or {}
+    return {
+        "clip_id": clip_id,
+        "media_id": context["media_id"],
+        "clip_name": context["clip_name"],
+        "project_name": context["project_name"],
+        "transcript": transcript,
+        "visual": visual,
+        "transcript_embeddings": embeddings,
+        "transcript_sidecar_path": str(transcript_path),
+        "visual_sidecar_path": str(visual_path),
+        "transcript_embeddings_sidecar_path": str(embeddings_path),
+    }, None
+
+
+def plan_ai_cut(
+    clip_ids: List[str],
+    goal: str = "short social cut",
+    style: str = "clean punchy talking-head",
+    max_ranges: int = 12,
+    max_punch_ins: int = 16,
+    max_cutaways: int = 12,
+    persist: bool = True,
+) -> Dict[str, Any]:
+    """Create a scored edit plan from transcript + visual sidecars."""
+    clips: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    project_name = "Project"
+    for cid in clip_ids:
+        payload, err = _ai_cut_clip_payload(str(cid))
+        if err:
+            errors.append({"clip_id": cid, "error": err.get("error", err)})
+            continue
+        assert payload is not None
+        project_name = str(payload.get("project_name") or project_name)
+        clips.append(payload)
+    if not clips:
+        return _err(
+            "plan_ai_cut requires at least one valid clip with cached sidecars.",
+            code="NO_VALID_CLIPS",
+            category="precondition",
+            remediation="Run analyze_clip_transcript and analyze_clip_visual/deep VLM first.",
+        )
+    plan = plan_ai_cut_from_sidecars(
+        clips,
+        goal=goal,
+        style=style,
+        max_ranges=int(max_ranges or 12),
+        max_punch_ins=int(max_punch_ins or 16),
+        max_cutaways=int(max_cutaways or 12),
+    )
+    if errors:
+        plan["clip_errors"] = errors
+    path = ai_cut_plan_path(project_name, plan.get("plan_id"))
+    if persist:
+        write_json_atomic(path, plan)
+    plan["sidecar_path"] = str(path)
+    plan["persisted"] = bool(persist)
+    return plan
+
+
+def apply_ai_cut_plan(plan_id: Optional[str] = None, plan: Optional[Dict[str, Any]] = None, project_name: Optional[str] = None) -> Dict[str, Any]:
+    """Second-stage cut-plan action.
+
+    This first pass intentionally returns an application preview. Timeline
+    mutation should be wired once the user confirms how aggressive assembly
+    should be for selected ranges, punch-ins, and cutaways.
+    """
+    payload = dict(plan or {})
+    if not payload and plan_id:
+        path = ai_cut_plan_path(project_name or "Project", plan_id)
+        if not path.exists() and project_name is None:
+            # Try the active project if available.
+            try:
+                _pm, proj, err = _check()
+                if not err:
+                    name, _pid = _project_name_and_id(proj)
+                    path = ai_cut_plan_path(name, plan_id)
+            except Exception:
+                pass
+        if not path.exists():
+            return _err(
+                f"Cut plan not found: {plan_id}",
+                code="CUT_PLAN_NOT_FOUND",
+                category="precondition",
+            )
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    if not payload:
+        return _err("apply_ai_cut_plan requires plan_id or plan", code="MISSING_PLAN", category="precondition")
+    return apply_ai_cut_plan_preview(payload)
+
+
+def verify_ai_cut_plan(plan_id: Optional[str] = None, plan: Optional[Dict[str, Any]] = None, project_name: Optional[str] = None) -> Dict[str, Any]:
+    payload = dict(plan or {})
+    if not payload and plan_id:
+        path = ai_cut_plan_path(project_name or "Project", plan_id)
+        if not path.exists() and project_name is None:
+            try:
+                _pm, proj, err = _check()
+                if not err:
+                    name, _pid = _project_name_and_id(proj)
+                    path = ai_cut_plan_path(name, plan_id)
+            except Exception:
+                pass
+        if not path.exists():
+            return _err(
+                f"Cut plan not found: {plan_id}",
+                code="CUT_PLAN_NOT_FOUND",
+                category="precondition",
+            )
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    if not payload:
+        return _err("verify_ai_cut_plan requires plan_id or plan", code="MISSING_PLAN", category="precondition")
+    return verify_ai_cut_plan_preview(payload)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # TOOL 13d/13e: clip_transcript
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -14603,10 +15779,20 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
     review_timeline_markers -> {path, samples, vision_review?}
     analyze_motion       -> {analyzed, media_id, sidecar_path, event_count, events_summary}
     get_motion           -> {analyzed, media_id, events, [frames]}
-    analyze_clip_visual  -> {analyzed, media_id, sidecar_path, metadata_rollup}
+    analyze_clip_visual  -> {analyzed, media_id, sidecar_path, metadata_rollup}; analysis_backend="runpod" can submit remote GPU work
+    runpod_stage_clip    -> upload one clip to the configured RunPod network volume without analyzing
+    runpod_visual_status -> poll/commit a previously submitted RunPod visual job
+    runpod_visual_submit_batch -> submit one RunPod visual job per clip_id without waiting
+    runpod_visual_deep_keyframes -> submit only selected JPEGs for the deep VLM pass after a fast sidecar exists
+    runpod_visual_keyframes_status -> poll/commit a submitted JPEG-only deep VLM job
     get_visual           -> cached visual sidecar; never triggers analysis
     analyze_clip_transcript -> {analyzed, media_id, sidecar_path, srt_path}
     get_transcript       -> cached transcript sidecar; never triggers analysis
+    analyze_transcript_embeddings -> cached semantic transcript vectors for story/search
+    query_transcript_semantic -> meaning search across transcript sidecars
+    plan_ai_cut         -> scored edit plan from transcript + visual sidecars
+    apply_ai_cut_plan   -> second-stage cut-plan action/preview
+    verify_ai_cut_plan  -> compare applied timeline against a persisted plan when apply is implemented
     start_batch_job      -> {job_id, status}
     batch_job_status     -> {job_id, status, progress, recent_events, clip_states}
     All actions may return {"error": {code, category, retryable, message, remediation, reason?}}.
@@ -14631,10 +15817,20 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
       detect_sync_events(paths?|target?, event_types?, windows?) -> {files, alignment}
       analyze_motion(clip_id, force?, sample_every_n?, proxy_width?, model?) -> cached YOLO Pose source-frame motion analysis under ~/Resolve_Analysis
       get_motion(clip_id, include_frames?) -> read cached source-frame motion events; never runs YOLO
-      analyze_clip_visual(clip_id, tier?, force?, sample_every_n?, object_every_n?|object_every_seconds?, batch_size?, dry_run?) -> source-safe visual analysis + metadata rollup
+      analyze_clip_visual(clip_id, tier?, force?, sample_every_n?, object_every_n?|object_every_seconds?, batch_size?, dry_run?, analysis_backend?, runpod_use_proxy?) -> source-safe visual analysis + metadata rollup; pass analysis_backend="runpod" for optional remote GPU dispatch
+      runpod_stage_clip(clip_id, dry_run?) -> upload one clip to the configured RunPod network volume and return s3:// plus /runpod-volume paths
+      runpod_visual_submit_batch(clip_ids, ...) -> submit remote visual jobs for multiple clips so RunPod can scale workers in parallel
+      runpod_visual_status(clip_id, job_id, wait?) -> poll a RunPod visual job and commit its sidecar/metadata when complete
+      runpod_visual_deep_keyframes(clip_id, vlm_model, max_keyframes?, image_width?) -> submit selected JPEGs only for deep VLM after a fast sidecar exists
+      runpod_visual_keyframes_status(clip_id, job_id, wait?) -> poll a JPEG-only deep VLM job and merge it into the visual sidecar
       get_visual(clip_id, include_frames?) -> read cached visual sidecar; never runs analysis
       analyze_clip_transcript(clip_id, force?, model?, dry_run?, export_srt?, import_srt?) -> local Parakeet transcript sidecar + metadata/SRT projection
       get_transcript(clip_id, include_words?) -> read cached source-frame transcript; never runs transcription
+      analyze_transcript_embeddings(clip_id, force?, dimensions?, window_lines?) -> source-frame transcript semantic vectors
+      query_transcript_semantic(clip_ids, query, limit?, auto_build?) -> meaning search over transcript lines
+      plan_ai_cut(clip_ids, goal?, style?) -> choose ranges/punch-ins/cutaways using transcript + visuals
+      apply_ai_cut_plan(plan_id|plan) -> second-stage cut-plan application preview
+      verify_ai_cut_plan(plan_id|plan) -> verification/diff contract for applied cut plans
       add_sync_event_markers(target?|paths?|detections?, confirm?) -> {added, skipped}
       publish_clip_metadata(target?, fields?, slate_detection?, timed_markers?|write_markers?, dry_run?, confirm?) -> {results}
       commit_vision(clip_id|file_path|clip_dir, visual, vision_token?, analysis_root?, publish_metadata?, dry_run?, confirm?) -> {analysis_json, marker_plan_json, metadata_publish}
@@ -14881,8 +16077,180 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
             expression=_media_analysis_bool(p.get("expression"), True),
             expression_every_n=int(p.get("expression_every_n", p.get("expressionEveryN", 2)) or 2),
             vlm_model=p.get("vlm_model") or p.get("vlmModel"),
-            vlm_max_keyframes=int(p.get("vlm_max_keyframes", p.get("vlmMaxKeyframes", 12)) or 12),
+            vlm_max_keyframes=int(p.get("vlm_max_keyframes", p.get("vlmMaxKeyframes", 0)) or 0),
+            analysis_backend=str(p.get("analysis_backend", p.get("analysisBackend", p.get("backend", "local"))) or "local"),
+            runpod_endpoint_id=p.get("runpod_endpoint_id") or p.get("runpodEndpointId"),
+            runpod_endpoint_url=p.get("runpod_endpoint_url") or p.get("runpodEndpointUrl"),
+            runpod_api_key_env=str(p.get("runpod_api_key_env", p.get("runpodApiKeyEnv", DEFAULT_RUNPOD_API_KEY_ENV)) or DEFAULT_RUNPOD_API_KEY_ENV),
+            runpod_file_url=p.get("runpod_file_url") or p.get("runpodFileUrl"),
+            runpod_local_prefix=p.get("runpod_local_prefix") or p.get("runpodLocalPrefix"),
+            runpod_url_prefix=p.get("runpod_url_prefix") or p.get("runpodUrlPrefix"),
+            runpod_wait=_media_analysis_bool(p.get("runpod_wait", p.get("runpodWait")), True),
+            runpod_poll_interval=float(p.get("runpod_poll_interval", p.get("runpodPollInterval", 2.0)) or 2.0),
+            runpod_timeout=float(p.get("runpod_timeout", p.get("runpodTimeout", 30.0)) or 30.0),
+            runpod_max_wait_seconds=float(p.get("runpod_max_wait_seconds", p.get("runpodMaxWaitSeconds", 1800.0)) or 1800.0),
+            runpod_use_proxy=_media_analysis_bool(p.get("runpod_use_proxy", p.get("runpodUseProxy")), False),
+            runpod_proxy_width=int(p.get("runpod_proxy_width", p.get("runpodProxyWidth", 960)) or 960),
+            runpod_proxy_crf=int(p.get("runpod_proxy_crf", p.get("runpodProxyCrf", 30)) or 30),
         )
+    if action == "runpod_stage_clip":
+        clip_id = p.get("clip_id") or p.get("clipId")
+        if not clip_id:
+            return _err("runpod_stage_clip requires clip_id")
+        target_proj, clip, clip_err = _motion_target_clip(str(clip_id))
+        if clip_err:
+            return clip_err
+        clip_context, context_err = _motion_clip_context(target_proj, clip)
+        if context_err:
+            return context_err
+        try:
+            staged = stage_file_to_runpod_network_volume(
+                file_path=clip_context["file_path"],
+                project_name=str(clip_context.get("project_name") or project_name or "Project"),
+                media_id=str(clip_context.get("media_id") or ""),
+                network_volume_id=p.get("runpod_network_volume_id") or p.get("runpodNetworkVolumeId"),
+                data_center_id=p.get("runpod_network_volume_datacenter_id") or p.get("runpodNetworkVolumeDatacenterId"),
+                endpoint_url=p.get("runpod_network_volume_endpoint_url") or p.get("runpodNetworkVolumeEndpointUrl"),
+                remote_prefix=p.get("runpod_volume_remote_prefix") or p.get("runpodVolumeRemotePrefix"),
+                dry_run=_media_analysis_bool(p.get("dry_run", p.get("dryRun")), False),
+                api_key_env=str(p.get("runpod_api_key_env", p.get("runpodApiKeyEnv", DEFAULT_RUNPOD_API_KEY_ENV)) or DEFAULT_RUNPOD_API_KEY_ENV),
+                timeout=float(p.get("runpod_timeout", p.get("runpodTimeout", 30.0)) or 30.0),
+            )
+        except (RunPodConfigError, RunPodJobError, Exception) as exc:
+            return _err(str(exc), code="RUNPOD_STAGE_FAILED", category="runpod")
+        if not staged:
+            return _err(
+                "runpod_stage_clip requires RUNPOD_NETWORK_VOLUME_ID or runpod_network_volume_id.",
+                code="RUNPOD_VOLUME_NOT_CONFIGURED",
+                category="configuration",
+            )
+        return {
+            "success": True,
+            "analysis_backend": "runpod",
+            "media_id": clip_context["media_id"],
+            "clip_name": clip_context["clip_name"],
+            "file_path": clip_context["file_path"],
+            "staging": _runpod_staging_preview(staged),
+        }
+    if action == "runpod_visual_status":
+        clip_id = p.get("clip_id") or p.get("clipId")
+        job_id = p.get("job_id") or p.get("jobId") or p.get("runpod_job_id") or p.get("runpodJobId")
+        if not clip_id or not job_id:
+            return _err("runpod_visual_status requires clip_id and job_id")
+        return _commit_runpod_visual_status(
+            clip_id=str(clip_id),
+            job_id=str(job_id),
+            wait=_media_analysis_bool(p.get("wait"), False),
+            write_metadata=_media_analysis_bool(p.get("write_metadata", p.get("writeMetadata")), True),
+            dry_run=_media_analysis_bool(p.get("dry_run", p.get("dryRun")), False),
+            runpod_endpoint_id=p.get("runpod_endpoint_id") or p.get("runpodEndpointId"),
+            runpod_endpoint_url=p.get("runpod_endpoint_url") or p.get("runpodEndpointUrl"),
+            runpod_api_key_env=str(p.get("runpod_api_key_env", p.get("runpodApiKeyEnv", DEFAULT_RUNPOD_API_KEY_ENV)) or DEFAULT_RUNPOD_API_KEY_ENV),
+            runpod_poll_interval=float(p.get("runpod_poll_interval", p.get("runpodPollInterval", 2.0)) or 2.0),
+            runpod_timeout=float(p.get("runpod_timeout", p.get("runpodTimeout", 30.0)) or 30.0),
+            runpod_max_wait_seconds=float(p.get("runpod_max_wait_seconds", p.get("runpodMaxWaitSeconds", 1800.0)) or 1800.0),
+        )
+    if action == "runpod_visual_deep_keyframes":
+        clip_id = p.get("clip_id") or p.get("clipId")
+        if not clip_id:
+            return _err("runpod_visual_deep_keyframes requires clip_id")
+        return _submit_runpod_vlm_keyframes(
+            clip_id=str(clip_id),
+            vlm_model=p.get("vlm_model") or p.get("vlmModel"),
+            max_keyframes=int(p.get("max_keyframes", p.get("maxKeyframes", p.get("vlm_max_keyframes", p.get("vlmMaxKeyframes", 0)))) or 0),
+            image_width=int(p.get("image_width", p.get("imageWidth", 1920)) or 1920),
+            runpod_proxy_width=int(p.get("runpod_proxy_width", p.get("runpodProxyWidth", 1920)) or 1920),
+            runpod_proxy_crf=int(p.get("runpod_proxy_crf", p.get("runpodProxyCrf", 30)) or 30),
+            write_metadata=_media_analysis_bool(p.get("write_metadata", p.get("writeMetadata")), True),
+            dry_run=_media_analysis_bool(p.get("dry_run", p.get("dryRun")), False),
+            runpod_endpoint_id=p.get("runpod_endpoint_id") or p.get("runpodEndpointId"),
+            runpod_endpoint_url=p.get("runpod_endpoint_url") or p.get("runpodEndpointUrl"),
+            runpod_api_key_env=str(p.get("runpod_api_key_env", p.get("runpodApiKeyEnv", DEFAULT_RUNPOD_API_KEY_ENV)) or DEFAULT_RUNPOD_API_KEY_ENV),
+            runpod_timeout=float(p.get("runpod_timeout", p.get("runpodTimeout", 30.0)) or 30.0),
+        )
+    if action == "runpod_visual_keyframes_status":
+        clip_id = p.get("clip_id") or p.get("clipId")
+        job_id = p.get("job_id") or p.get("jobId") or p.get("runpod_job_id") or p.get("runpodJobId")
+        if not clip_id or not job_id:
+            return _err("runpod_visual_keyframes_status requires clip_id and job_id")
+        return _commit_runpod_vlm_keyframes_status(
+            clip_id=str(clip_id),
+            job_id=str(job_id),
+            wait=_media_analysis_bool(p.get("wait"), False),
+            write_metadata=_media_analysis_bool(p.get("write_metadata", p.get("writeMetadata")), True),
+            dry_run=_media_analysis_bool(p.get("dry_run", p.get("dryRun")), False),
+            runpod_endpoint_id=p.get("runpod_endpoint_id") or p.get("runpodEndpointId"),
+            runpod_endpoint_url=p.get("runpod_endpoint_url") or p.get("runpodEndpointUrl"),
+            runpod_api_key_env=str(p.get("runpod_api_key_env", p.get("runpodApiKeyEnv", DEFAULT_RUNPOD_API_KEY_ENV)) or DEFAULT_RUNPOD_API_KEY_ENV),
+            runpod_poll_interval=float(p.get("runpod_poll_interval", p.get("runpodPollInterval", 2.0)) or 2.0),
+            runpod_timeout=float(p.get("runpod_timeout", p.get("runpodTimeout", 30.0)) or 30.0),
+            runpod_max_wait_seconds=float(p.get("runpod_max_wait_seconds", p.get("runpodMaxWaitSeconds", 1800.0)) or 1800.0),
+        )
+    if action == "runpod_visual_submit_batch":
+        raw_ids = p.get("clip_ids") or p.get("clipIds") or p.get("ids")
+        if isinstance(raw_ids, str):
+            clip_ids = [item.strip() for item in raw_ids.split(",") if item.strip()]
+        elif isinstance(raw_ids, list):
+            clip_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+        else:
+            clip_ids = []
+        if not clip_ids:
+            return _err("runpod_visual_submit_batch requires clip_ids")
+        file_urls = p.get("runpod_file_urls") or p.get("runpodFileUrls") or {}
+        if not isinstance(file_urls, dict):
+            file_urls = {}
+        results = []
+        for cid in clip_ids:
+            result = analyze_clip_visual(
+                cid,
+                tier=str(p.get("tier") or "fast"),
+                force=_media_analysis_bool(p.get("force"), False),
+                sample_every_n=int(p.get("sample_every_n", p.get("sampleEveryN", 10)) or 10),
+                object_every_n=(
+                    int(p.get("object_every_n", p.get("objectEveryN")))
+                    if p.get("object_every_n", p.get("objectEveryN")) not in {None, ""}
+                    else None
+                ),
+                object_every_seconds=float(p.get("object_every_seconds", p.get("objectEverySeconds", 5.0)) or 5.0),
+                batch_size=int(p.get("batch_size", p.get("batchSize", 1)) or 1),
+                proxy_width=int(p.get("proxy_width", p.get("proxyWidth", 640)) or 640),
+                dry_run=_media_analysis_bool(p.get("dry_run", p.get("dryRun")), False),
+                write_metadata=_media_analysis_bool(p.get("write_metadata", p.get("writeMetadata")), True),
+                pose_model=str(p.get("pose_model", p.get("poseModel", "yolo11n-pose"))),
+                object_model=str(p.get("object_model", p.get("objectModel", "yolo11n"))),
+                expression=_media_analysis_bool(p.get("expression"), True),
+                expression_every_n=int(p.get("expression_every_n", p.get("expressionEveryN", 2)) or 2),
+                vlm_model=p.get("vlm_model") or p.get("vlmModel"),
+                vlm_max_keyframes=int(p.get("vlm_max_keyframes", p.get("vlmMaxKeyframes", 0)) or 0),
+                analysis_backend="runpod",
+                runpod_endpoint_id=p.get("runpod_endpoint_id") or p.get("runpodEndpointId"),
+                runpod_endpoint_url=p.get("runpod_endpoint_url") or p.get("runpodEndpointUrl"),
+                runpod_api_key_env=str(p.get("runpod_api_key_env", p.get("runpodApiKeyEnv", DEFAULT_RUNPOD_API_KEY_ENV)) or DEFAULT_RUNPOD_API_KEY_ENV),
+                runpod_file_url=file_urls.get(cid) or p.get("runpod_file_url") or p.get("runpodFileUrl"),
+                runpod_local_prefix=p.get("runpod_local_prefix") or p.get("runpodLocalPrefix"),
+                runpod_url_prefix=p.get("runpod_url_prefix") or p.get("runpodUrlPrefix"),
+                runpod_wait=False,
+                runpod_poll_interval=float(p.get("runpod_poll_interval", p.get("runpodPollInterval", 2.0)) or 2.0),
+                runpod_timeout=float(p.get("runpod_timeout", p.get("runpodTimeout", 30.0)) or 30.0),
+                runpod_max_wait_seconds=float(p.get("runpod_max_wait_seconds", p.get("runpodMaxWaitSeconds", 1800.0)) or 1800.0),
+                runpod_use_proxy=_media_analysis_bool(p.get("runpod_use_proxy", p.get("runpodUseProxy")), False),
+                runpod_proxy_width=int(p.get("runpod_proxy_width", p.get("runpodProxyWidth", 960)) or 960),
+                runpod_proxy_crf=int(p.get("runpod_proxy_crf", p.get("runpodProxyCrf", 30)) or 30),
+            )
+            results.append({"clip_id": cid, **result})
+        submitted = [item for item in results if item.get("analyzed") == "submitted"]
+        cached = [item for item in results if item.get("analyzed") == "cached"]
+        failed = [item for item in results if item.get("analyzed") is False]
+        return {
+            "success": len(failed) == 0,
+            "analysis_backend": "runpod",
+            "clip_count": len(results),
+            "submitted_count": len(submitted),
+            "cached_count": len(cached),
+            "failed_count": len(failed),
+            "jobs": results,
+            "next_action": "Poll each submitted job with media_analysis(action='runpod_visual_status', params={clip_id, job_id}).",
+        }
     if action == "get_visual":
         clip_id = p.get("clip_id") or p.get("clipId")
         if not clip_id:
@@ -14919,6 +16287,66 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
         return get_transcript(
             str(clip_id),
             include_words=_media_analysis_bool(p.get("include_words", p.get("includeWords")), True),
+        )
+    if action == "analyze_transcript_embeddings":
+        clip_id = p.get("clip_id") or p.get("clipId")
+        if not clip_id:
+            return _err("analyze_transcript_embeddings requires clip_id")
+        return analyze_transcript_embeddings(
+            str(clip_id),
+            force=_media_analysis_bool(p.get("force"), False),
+            dimensions=int(p.get("dimensions", 384) or 384),
+            window_lines=int(p.get("window_lines", p.get("windowLines", 1)) or 1),
+        )
+    if action == "query_transcript_semantic":
+        raw_ids = p.get("clip_ids") or p.get("clipIds") or p.get("ids") or p.get("clip_id") or p.get("clipId")
+        if isinstance(raw_ids, str):
+            clip_ids = [item.strip() for item in raw_ids.split(",") if item.strip()]
+        elif isinstance(raw_ids, list):
+            clip_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+        else:
+            clip_ids = []
+        query = str(p.get("query") or "").strip()
+        if not clip_ids:
+            return _err("query_transcript_semantic requires clip_ids")
+        if not query:
+            return _err("query_transcript_semantic requires query")
+        return query_transcript_semantic(
+            clip_ids,
+            query,
+            limit=int(p.get("limit", 10) or 10),
+            auto_build=_media_analysis_bool(p.get("auto_build", p.get("autoBuild")), True),
+        )
+    if action == "plan_ai_cut":
+        raw_ids = p.get("clip_ids") or p.get("clipIds") or p.get("ids") or p.get("clip_id") or p.get("clipId")
+        if isinstance(raw_ids, str):
+            clip_ids = [item.strip() for item in raw_ids.split(",") if item.strip()]
+        elif isinstance(raw_ids, list):
+            clip_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+        else:
+            clip_ids = []
+        if not clip_ids:
+            return _err("plan_ai_cut requires clip_ids")
+        return plan_ai_cut(
+            clip_ids,
+            goal=str(p.get("goal") or "short social cut"),
+            style=str(p.get("style") or "clean punchy talking-head"),
+            max_ranges=int(p.get("max_ranges", p.get("maxRanges", 12)) or 12),
+            max_punch_ins=int(p.get("max_punch_ins", p.get("maxPunchIns", 16)) or 16),
+            max_cutaways=int(p.get("max_cutaways", p.get("maxCutaways", 12)) or 12),
+            persist=_media_analysis_bool(p.get("persist"), True),
+        )
+    if action == "apply_ai_cut_plan":
+        return apply_ai_cut_plan(
+            plan_id=p.get("plan_id") or p.get("planId"),
+            plan=p.get("plan") if isinstance(p.get("plan"), dict) else None,
+            project_name=p.get("project_name") or p.get("projectName"),
+        )
+    if action == "verify_ai_cut_plan":
+        return verify_ai_cut_plan(
+            plan_id=p.get("plan_id") or p.get("planId"),
+            plan=p.get("plan") if isinstance(p.get("plan"), dict) else None,
+            project_name=p.get("project_name") or p.get("projectName"),
         )
 
     if action == "resolve_output_root":
