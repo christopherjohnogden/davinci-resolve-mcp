@@ -11,6 +11,8 @@ import hashlib
 import json
 import math
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -47,6 +49,159 @@ _SEMANTIC_EXPANSIONS = {
 
 _FILLER_WORDS = {
     "um", "uh", "erm", "ah", "like", "you know", "i mean", "sort of", "kind of",
+}
+
+_STYLE_PROFILES: Dict[str, Dict[str, Any]] = {
+    "clean_talking_head": {
+        "label": "Clean talking head",
+        "selection_bias": "clarity and natural pacing",
+        "ideal_line_words": (8, 36),
+        "prefer_short_lines": False,
+        "prefer_motion": True,
+        "needs_punch_ins": True,
+        "needs_cutaways": False,
+        "notes": [
+            "Preserve clarity and natural breath.",
+            "Remove obvious resets/dead air without over-compressing.",
+            "Use punch-ins as polish, not as the edit's foundation.",
+        ],
+    },
+    "punchy_social": {
+        "label": "Punchy social",
+        "selection_bias": "hook, directness, and pace",
+        "ideal_line_words": (5, 22),
+        "prefer_short_lines": True,
+        "prefer_motion": True,
+        "needs_punch_ins": True,
+        "needs_cutaways": False,
+        "notes": [
+            "Front-load the strongest hook.",
+            "Prefer short, direct lines over caveats and setup.",
+            "Use visual energy and punch-ins to keep momentum.",
+        ],
+    },
+    "interview_doc": {
+        "label": "Interview/doc",
+        "selection_bias": "story arc, specificity, and emotional delivery",
+        "ideal_line_words": (10, 55),
+        "prefer_short_lines": False,
+        "prefer_motion": False,
+        "needs_punch_ins": False,
+        "needs_cutaways": True,
+        "notes": [
+            "Build an emotional/logical arc, not just clean answers.",
+            "Preserve meaningful pauses and expression changes.",
+            "Use VLM/expression/story beats when available.",
+        ],
+    },
+    "promo": {
+        "label": "Promo",
+        "selection_bias": "offer, benefit, proof, and CTA",
+        "ideal_line_words": (5, 24),
+        "prefer_short_lines": True,
+        "prefer_motion": True,
+        "needs_punch_ins": True,
+        "needs_cutaways": True,
+        "notes": [
+            "Prioritize the offer/benefit/proof/CTA chain.",
+            "Remove rambling setup unless it builds trust.",
+            "End with a button or call to action.",
+        ],
+    },
+    "fast_hype": {
+        "label": "Fast hype",
+        "selection_bias": "energy, action, rhythm, escalation",
+        "ideal_line_words": (2, 14),
+        "prefer_short_lines": True,
+        "prefer_motion": True,
+        "needs_punch_ins": True,
+        "needs_cutaways": True,
+        "notes": [
+            "Favor short phrases, motion, and visual escalation.",
+            "Coverage and rhythm can matter more than full sentence continuity.",
+            "Use action/motion peaks aggressively, then let the skill decide final density.",
+        ],
+    },
+    "sermon_event": {
+        "label": "Sermon/event",
+        "selection_bias": "chronology, clarity, and restraint",
+        "ideal_line_words": (8, 70),
+        "prefer_short_lines": False,
+        "prefer_motion": False,
+        "needs_punch_ins": False,
+        "needs_cutaways": False,
+        "notes": [
+            "Preserve chronology unless the user explicitly asks for highlights.",
+            "Tighten dead air carefully.",
+            "Use VLM mostly for chaptering/context, not aggressive reconstruction.",
+        ],
+    },
+}
+
+_STYLE_ALIASES = {
+    "clean": "clean_talking_head",
+    "talking_head": "clean_talking_head",
+    "clean punchy talking-head": "punchy_social",
+    "social": "punchy_social",
+    "short social cut": "punchy_social",
+    "punchy": "punchy_social",
+    "interview": "interview_doc",
+    "doc": "interview_doc",
+    "documentary": "interview_doc",
+    "hype": "fast_hype",
+    "event": "sermon_event",
+    "sermon": "sermon_event",
+}
+
+_PROMO_TERMS = {"join", "come", "register", "sign", "today", "now", "free", "offer", "get", "try", "call", "visit"}
+_HYPE_TERMS = {"go", "now", "win", "build", "move", "start", "fast", "big", "new", "best", "never"}
+_INTERVIEW_TERMS = {"felt", "realized", "learned", "remember", "because", "changed", "hard", "honest", "moment"}
+
+_CONTENT_TYPE_ALIASES = {
+    "talking_head": "talking_head",
+    "talking-head": "talking_head",
+    "interview": "interview",
+    "doc": "interview",
+    "documentary": "interview",
+    "promo": "promo",
+    "ad": "promo",
+    "commercial": "promo",
+    "hype": "fast_hype",
+    "fast_hype": "fast_hype",
+    "sermon": "event_sermon",
+    "event": "event_sermon",
+    "event_sermon": "event_sermon",
+    "podcast": "podcast",
+    "tutorial": "tutorial",
+    "product_demo": "product_demo",
+    "demo": "product_demo",
+    "vlog": "vlog",
+}
+
+_CUT_INTENT_ALIASES = {
+    "narrative": "narrative",
+    "story": "narrative",
+    "peak": "peak_highlight",
+    "highlight": "peak_highlight",
+    "peak_highlight": "peak_highlight",
+    "multi_clip": "multi_clip",
+    "multiclip": "multi_clip",
+    "assembled_short": "assembled_short",
+    "short": "assembled_short",
+    "surgical": "surgical_tighten",
+    "tighten": "surgical_tighten",
+    "surgical_tighten": "surgical_tighten",
+}
+
+_TIMELINE_MODE_ALIASES = {
+    "raw": "raw_dump",
+    "raw_dump": "raw_dump",
+    "source": "raw_dump",
+    "assembled": "assembled",
+    "stringout": "assembled",
+    "string_out": "assembled",
+    "multicam": "multicam",
+    "assembly": "assembly",
 }
 
 
@@ -156,15 +311,189 @@ def query_transcript_embeddings(indexes: Sequence[Dict[str, Any]], query: str, l
     return results[: max(1, int(limit or 10))]
 
 
+def resolve_edit_axes(
+    *,
+    content_type: str = "auto",
+    cut_intent: str = "auto",
+    target_duration: str = "",
+    timeline_mode: str = "raw_dump",
+    num_clips: int = 1,
+    takes_already_scrubbed: bool = False,
+    reorder_allowed: bool = True,
+    style_key: str = "clean_talking_head",
+) -> Dict[str, Any]:
+    """Resolve CutMaster-style edit axes into deterministic planning rules.
+
+    This keeps taste out of the MCP: the engine exposes axis-derived pacing,
+    reorder, and selection strategy; the skill still applies thresholds.
+    """
+
+    content = _canonical_content_type(content_type, style_key)
+    mode = _canonical_timeline_mode(timeline_mode)
+    intent = _canonical_cut_intent(cut_intent)
+    if intent == "auto":
+        intent = _infer_cut_intent(
+            content_type=content,
+            target_duration=target_duration,
+            timeline_mode=mode,
+            num_clips=num_clips,
+            takes_already_scrubbed=takes_already_scrubbed,
+            style_key=style_key,
+        )
+
+    strategy = {
+        "narrative": "narrative_arc",
+        "peak_highlight": "peak_hunt",
+        "multi_clip": "top_n_moments",
+        "assembled_short": "montage_short",
+        "surgical_tighten": "preserve_structure",
+    }.get(intent, "narrative_arc")
+
+    if not reorder_allowed or content in {"event_sermon", "tutorial"} or intent == "surgical_tighten":
+        reorder_mode = "locked"
+    elif intent in {"peak_highlight", "assembled_short"} and content in {"promo", "fast_hype", "vlog"}:
+        reorder_mode = "free"
+    elif intent == "multi_clip":
+        reorder_mode = "per_clip_chronological"
+    else:
+        reorder_mode = "story_safe"
+
+    pacing = _segment_pacing_for_axes(content, intent, style_key)
+    warnings: List[str] = []
+    if intent == "surgical_tighten" and mode not in {"assembled", "assembly", "multicam"}:
+        warnings.append("surgical_tighten is safest on an already assembled timeline; raw source needs stronger transcript boundaries.")
+    if content == "event_sermon" and reorder_mode != "locked":
+        warnings.append("event/sermon content should normally preserve chronology.")
+    if intent in {"peak_highlight", "assembled_short"} and not str(target_duration or "").strip():
+        warnings.append("highlight/short intent works best with a target_duration.")
+
+    return {
+        "content_type": content,
+        "cut_intent": intent,
+        "timeline_mode": mode,
+        "num_clips": int(num_clips or 0),
+        "takes_already_scrubbed": bool(takes_already_scrubbed),
+        "reorder_allowed": bool(reorder_allowed),
+        "reorder_mode": reorder_mode,
+        "selection_strategy": strategy,
+        "segment_pacing": pacing,
+        "warnings": warnings,
+    }
+
+
+def probe_source_preflight(file_path: Any, expected_fps: Optional[float] = None) -> Dict[str, Any]:
+    """Small ffprobe preflight for frame-math risk such as VFR footage."""
+
+    path = Path(str(file_path or "")).expanduser()
+    result: Dict[str, Any] = {
+        "file_path": str(path) if str(file_path or "") else "",
+        "exists": path.exists() if str(file_path or "") else False,
+        "ffprobe_available": bool(shutil.which("ffprobe")),
+        "video": None,
+        "vfr": {"is_vfr": None, "severity": "unknown"},
+        "warnings": [],
+    }
+    if not str(file_path or ""):
+        result["warnings"].append("No source file path available.")
+        return result
+    if not path.exists():
+        result["warnings"].append("Source file is offline or not reachable from this machine.")
+        return result
+    if not result["ffprobe_available"]:
+        result["warnings"].append("ffprobe not found; cannot verify constant frame rate.")
+        return result
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,width,height,r_frame_rate,avg_frame_rate,nb_frames,duration",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if proc.returncode != 0:
+            result["warnings"].append((proc.stderr or "ffprobe failed").strip()[:300])
+            return result
+        data = json.loads(proc.stdout or "{}")
+        streams = data.get("streams") or []
+        stream = streams[0] if streams else {}
+        r_rate = _rate_to_float(stream.get("r_frame_rate"))
+        avg_rate = _rate_to_float(stream.get("avg_frame_rate"))
+        expected = float(expected_fps or 0.0) or None
+        base = expected or avg_rate or r_rate or 0.0
+        delta = abs((r_rate or 0.0) - (avg_rate or 0.0))
+        ratio = delta / base if base else 0.0
+        is_vfr = bool(r_rate and avg_rate and ratio > 0.001)
+        severity = "high" if ratio > 0.01 else ("warn" if is_vfr else "pass")
+        if is_vfr:
+            result["warnings"].append(
+                f"Potential VFR source: r_frame_rate={stream.get('r_frame_rate')} avg_frame_rate={stream.get('avg_frame_rate')}."
+            )
+        result.update(
+            {
+                "video": {
+                    "codec": stream.get("codec_name"),
+                    "width": _safe_int(stream.get("width")),
+                    "height": _safe_int(stream.get("height")),
+                    "duration_seconds": _safe_float(stream.get("duration")),
+                    "nb_frames": _safe_int(stream.get("nb_frames")),
+                    "r_frame_rate": stream.get("r_frame_rate"),
+                    "avg_frame_rate": stream.get("avg_frame_rate"),
+                    "r_frame_rate_float": r_rate,
+                    "avg_frame_rate_float": avg_rate,
+                    "expected_fps": expected,
+                },
+                "vfr": {
+                    "is_vfr": is_vfr,
+                    "severity": severity,
+                    "delta_fps": round(delta, 6),
+                    "delta_ratio": round(ratio, 6),
+                },
+            }
+        )
+    except Exception as exc:
+        result["warnings"].append(f"ffprobe preflight failed: {exc}")
+    return result
+
+
 def plan_ai_cut_from_sidecars(
     clips: Sequence[Dict[str, Any]],
     *,
     goal: str = "",
     style: str = "clean punchy talking-head",
+    target_duration: str = "",
+    undercut_bias: bool = True,
+    content_type: str = "auto",
+    cut_intent: str = "auto",
+    timeline_mode: str = "raw_dump",
+    takes_already_scrubbed: bool = False,
+    reorder_allowed: bool = True,
     max_ranges: int = 12,
     max_punch_ins: int = 16,
     max_cutaways: int = 12,
 ) -> Dict[str, Any]:
+    style_key = _canonical_style(style)
+    style_profile = _style_profile(style_key)
+    edit_axes = resolve_edit_axes(
+        content_type=content_type,
+        cut_intent=cut_intent,
+        target_duration=target_duration,
+        timeline_mode=timeline_mode,
+        num_clips=len(clips),
+        takes_already_scrubbed=takes_already_scrubbed,
+        reorder_allowed=reorder_allowed,
+        style_key=style_key,
+    )
     selected_ranges: List[Dict[str, Any]] = []
     punch_ins: List[Dict[str, Any]] = []
     cutaways: List[Dict[str, Any]] = []
@@ -193,10 +522,22 @@ def plan_ai_cut_from_sidecars(
                 "reason": _clip_role_reason(visual, transcript),
             }
         )
-        selected_ranges.extend(_selected_ranges_for_clip(clip_id, media_id, clip_name, transcript, visual, goal, role))
+        selected_ranges.extend(
+            _selected_ranges_for_clip(
+                clip_id,
+                media_id,
+                clip_name,
+                transcript,
+                visual,
+                goal,
+                role,
+                style_key,
+            )
+        )
         punch_ins.extend(_punch_ins_for_clip(clip_id, media_id, clip_name, visual, transcript))
         cutaways.extend(_cutaways_for_clip(clip_id, media_id, clip_name, visual, role))
 
+    redundancy_groups = _annotate_redundancy_groups(selected_ranges)
     selected_ranges.sort(key=lambda item: item.get("score") or 0.0, reverse=True)
     punch_ins.sort(key=lambda item: item.get("score") or 0.0, reverse=True)
     cutaways.sort(key=lambda item: item.get("score") or 0.0, reverse=True)
@@ -207,29 +548,65 @@ def plan_ai_cut_from_sidecars(
     }
     return {
         "schema_version": CUT_PLAN_SCHEMA_VERSION,
-        "plan_id": _plan_id(goal, style, [clip.get("media_id") for clip in clips]),
+        "plan_id": _plan_id(
+            "|".join([goal, edit_axes.get("content_type", ""), edit_axes.get("cut_intent", ""), target_duration]),
+            style,
+            [clip.get("media_id") for clip in clips],
+        ),
         "created_at": utc_now_iso(),
         "goal": goal,
         "style": style,
+        "style_key": style_key,
+        "target_duration": target_duration,
+        "edit_axes": edit_axes,
+        "edit_intent": {
+            "style_key": style_key,
+            "style_label": style_profile.get("label"),
+            "content_type": edit_axes.get("content_type"),
+            "cut_intent": edit_axes.get("cut_intent"),
+            "timeline_mode": edit_axes.get("timeline_mode"),
+            "selection_strategy": edit_axes.get("selection_strategy"),
+            "reorder_mode": edit_axes.get("reorder_mode"),
+            "selection_bias": style_profile.get("selection_bias"),
+            "target_duration": target_duration or None,
+            "undercut_bias": bool(undercut_bias),
+            "style_notes": style_profile.get("notes") or [],
+        },
         "status": "planned",
         "plan_semantics": {
             "type": "ranked_candidates",
             "thresholds_applied": False,
             "decision_owner": "assistant-editor skill",
             "note": "MCP scores candidates deterministically; the skill applies taste, under-cut bias, and approval thresholds.",
+            "candidate_contract": "Candidates may include low-confidence or redundant options. Do not treat returned candidates as final keep/drop commands.",
         },
         "analysis_depth": _overall_analysis_depth(inputs_used),
         "inputs_used": inputs_used,
         "clip_roles": clip_roles,
+        "redundancy_groups": redundancy_groups,
         "selected_ranges": selected_ranges[: max(1, int(max_ranges or 12))],
         "punch_ins": punch_ins[: max(1, int(max_punch_ins or 16))],
         "cutaways": cutaways[: max(1, int(max_cutaways or 12))],
         "candidate_counts": {
             **all_candidate_counts,
+            "redundancy_groups": len(redundancy_groups),
             "returned_selected_ranges": min(all_candidate_counts["selected_ranges"], max(1, int(max_ranges or 12))),
             "returned_punch_ins": min(all_candidate_counts["punch_ins"], max(1, int(max_punch_ins or 16))),
             "returned_cutaways": min(all_candidate_counts["cutaways"], max(1, int(max_cutaways or 12))),
         },
+        "quality_gates": _quality_gates_for_plan(
+            style_key=style_key,
+            target_duration=target_duration,
+            analysis_depth=_overall_analysis_depth(inputs_used),
+            candidate_counts=all_candidate_counts,
+            selected_ranges=selected_ranges,
+            punch_ins=punch_ins,
+            cutaways=cutaways,
+            redundancy_groups=redundancy_groups,
+            clip_roles=clip_roles,
+            inputs_used=inputs_used,
+            edit_axes=edit_axes,
+        ),
         "warnings": warnings,
         "apply_status": {
             "implemented": False,
@@ -265,6 +642,7 @@ def _clip_inputs_used(clip: Dict[str, Any], transcript: Dict[str, Any], visual: 
             "available": bool(clip.get("transcript_embeddings")),
             "engine": (clip.get("transcript_embeddings") or {}).get("engine") if isinstance(clip.get("transcript_embeddings"), dict) else None,
         },
+        "source_preflight": clip.get("source_preflight") or {},
     }
 
 
@@ -290,6 +668,111 @@ def _overall_analysis_depth(inputs: Sequence[Dict[str, Any]]) -> str:
     if has_transcript:
         return "transcript_only"
     return "insufficient"
+
+
+def _canonical_style(style: Any) -> str:
+    raw = str(style or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if raw in _STYLE_PROFILES:
+        return raw
+    loose = str(style or "").strip().lower()
+    if loose in _STYLE_ALIASES:
+        return _STYLE_ALIASES[loose]
+    for key in _STYLE_PROFILES:
+        if key in raw:
+            return key
+    if "promo" in raw:
+        return "promo"
+    if "hype" in raw or "fast" in raw:
+        return "fast_hype"
+    if "interview" in raw or "doc" in raw:
+        return "interview_doc"
+    if "sermon" in raw or "event" in raw:
+        return "sermon_event"
+    if "social" in raw or "punch" in raw:
+        return "punchy_social"
+    return "clean_talking_head"
+
+
+def _canonical_content_type(content_type: Any, style_key: str) -> str:
+    raw = str(content_type or "").strip().lower().replace(" ", "_")
+    if not raw or raw == "auto":
+        if style_key == "interview_doc":
+            return "interview"
+        if style_key == "promo":
+            return "promo"
+        if style_key == "fast_hype":
+            return "fast_hype"
+        if style_key == "sermon_event":
+            return "event_sermon"
+        return "talking_head"
+    return _CONTENT_TYPE_ALIASES.get(raw, raw if raw in set(_CONTENT_TYPE_ALIASES.values()) else "unknown")
+
+
+def _canonical_cut_intent(cut_intent: Any) -> str:
+    raw = str(cut_intent or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if not raw or raw == "auto":
+        return "auto"
+    return _CUT_INTENT_ALIASES.get(raw, "narrative")
+
+
+def _canonical_timeline_mode(timeline_mode: Any) -> str:
+    raw = str(timeline_mode or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if not raw:
+        return "raw_dump"
+    return _TIMELINE_MODE_ALIASES.get(raw, raw if raw in set(_TIMELINE_MODE_ALIASES.values()) else "raw_dump")
+
+
+def _infer_cut_intent(
+    *,
+    content_type: str,
+    target_duration: str,
+    timeline_mode: str,
+    num_clips: int,
+    takes_already_scrubbed: bool,
+    style_key: str,
+) -> str:
+    if takes_already_scrubbed or timeline_mode == "assembled":
+        return "surgical_tighten"
+    if style_key in {"promo", "fast_hype", "punchy_social"} and _target_duration_seconds(target_duration, 0) <= 120:
+        return "assembled_short"
+    if int(num_clips or 0) > 1 and content_type in {"promo", "fast_hype", "vlog"}:
+        return "multi_clip"
+    if str(target_duration or "").strip() and _target_duration_seconds(target_duration, 99999) <= 90:
+        return "peak_highlight"
+    return "narrative"
+
+
+def _segment_pacing_for_axes(content_type: str, cut_intent: str, style_key: str) -> Dict[str, Any]:
+    if cut_intent == "surgical_tighten":
+        return {"mode": "preserve_existing", "min_seconds": 2, "target_seconds": None, "max_seconds": None}
+    if cut_intent == "peak_highlight":
+        return {"mode": "highlight", "min_seconds": 3, "target_seconds": 8, "max_seconds": 18}
+    if cut_intent == "assembled_short":
+        return {"mode": "short_form", "min_seconds": 2, "target_seconds": 6, "max_seconds": 14}
+    if cut_intent == "multi_clip":
+        return {"mode": "multi_clip", "min_seconds": 4, "target_seconds": 12, "max_seconds": 24}
+    if content_type in {"interview", "podcast", "event_sermon"}:
+        return {"mode": "long_form_story", "min_seconds": 8, "target_seconds": 24, "max_seconds": 55}
+    if style_key in {"promo", "fast_hype"}:
+        return {"mode": "energetic", "min_seconds": 2, "target_seconds": 7, "max_seconds": 18}
+    return {"mode": "clean_story", "min_seconds": 5, "target_seconds": 16, "max_seconds": 36}
+
+
+def _target_duration_seconds(value: Any, default: int) -> int:
+    text = str(value or "").strip().lower()
+    if not text:
+        return default
+    nums = [float(item) for item in re.findall(r"\d+(?:\.\d+)?", text)]
+    if not nums:
+        return default
+    seconds = max(nums)
+    if "min" in text or (seconds <= 20 and "s" not in text and "sec" not in text):
+        seconds *= 60
+    return int(round(seconds))
+
+
+def _style_profile(style_key: str) -> Dict[str, Any]:
+    return dict(_STYLE_PROFILES.get(style_key) or _STYLE_PROFILES["clean_talking_head"])
 
 
 def classify_clip_role(visual: Dict[str, Any], transcript: Dict[str, Any]) -> str:
@@ -328,8 +811,10 @@ def _selected_ranges_for_clip(
     visual: Dict[str, Any],
     goal: str,
     role: str,
+    style_key: str,
 ) -> List[Dict[str, Any]]:
     ranges: List[Dict[str, Any]] = []
+    profile = _style_profile(style_key)
     goal_terms = set(_tokens(_expand_query(goal)))
     visual_events = visual.get("events") or []
     stills = [event for event in visual_events if event.get("type") == "still"]
@@ -347,13 +832,24 @@ def _selected_ranges_for_clip(
         filler_penalty = _filler_penalty(text)
         action = _nearest_event(action_events, (start + end) // 2, max_distance=180)
         still_conflict = any(_ranges_overlap(start, end, int(_num(event.get("start"), 0)), int(_num(event.get("end"), 0))) for event in stills)
-        score = 0.35 + min(0.25, len(words) / 80.0) + min(0.3, overlap * 0.08) - filler_penalty
+        style_fit = _style_fit_for_line(text, len(words), bool(action), style_key, profile)
+        base_score = 0.35 + min(0.25, len(words) / 80.0) + min(0.3, overlap * 0.08)
+        score = base_score - filler_penalty + float(style_fit.get("score_adjustment") or 0.0)
         if action:
             score += 0.15
         if still_conflict:
             score -= 0.08
         if role.startswith("main_take"):
             score += 0.08
+        score_breakdown = {
+            "base": round(base_score, 4),
+            "goal_overlap": overlap,
+            "filler_penalty": round(filler_penalty, 4),
+            "visual_action_bonus": 0.15 if action else 0.0,
+            "stillness_penalty": 0.08 if still_conflict else 0.0,
+            "main_take_bonus": 0.08 if role.startswith("main_take") else 0.0,
+            "style_adjustment": round(float(style_fit.get("score_adjustment") or 0.0), 4),
+        }
         ranges.append(
             {
                 "clip_id": clip_id,
@@ -362,8 +858,10 @@ def _selected_ranges_for_clip(
                 "source_in": start,
                 "source_out": max(end, start + 1),
                 "score": round(max(0.0, min(1.0, score)), 4),
+                "score_breakdown": score_breakdown,
                 "text": text,
                 "reason": _range_reason(text, action, still_conflict, overlap),
+                "style_fit": {key: value for key, value in style_fit.items() if key != "score_adjustment"},
                 "visual_anchor": _event_anchor(action) if action else None,
                 "line_index": index,
             }
@@ -486,6 +984,84 @@ def _cutaways_for_clip(clip_id: str, media_id: str, clip_name: str, visual: Dict
     return out
 
 
+def validate_ai_cut_plan_preview(plan: Dict[str, Any]) -> Dict[str, Any]:
+    errors: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
+    if not isinstance(plan, dict) or not plan:
+        errors.append({"id": "missing_plan", "message": "No plan payload supplied."})
+        plan = {}
+    if plan.get("schema_version") != CUT_PLAN_SCHEMA_VERSION:
+        warnings.append(
+            {
+                "id": "schema_version",
+                "message": f"Expected schema_version {CUT_PLAN_SCHEMA_VERSION}; got {plan.get('schema_version')}.",
+            }
+        )
+    semantics = plan.get("plan_semantics") or {}
+    if semantics.get("type") != "ranked_candidates":
+        errors.append({"id": "plan_semantics", "message": "Plan must be a ranked_candidates contract, not a final command list."})
+    if semantics.get("thresholds_applied") is not False:
+        warnings.append({"id": "thresholds", "message": "Plan does not clearly declare thresholds_applied=false."})
+
+    ranges = plan.get("selected_ranges") or []
+    if not ranges:
+        errors.append({"id": "no_selected_ranges", "message": "Plan has no selected range candidates."})
+    for index, item in enumerate(ranges):
+        source_in = int(_num(item.get("source_in"), -1))
+        source_out = int(_num(item.get("source_out"), -1))
+        if source_in < 0 or source_out <= source_in:
+            errors.append({"id": "invalid_range", "index": index, "message": "selected_ranges source_out must be greater than source_in."})
+        score = _num(item.get("score"), -1)
+        if score < 0 or score > 1:
+            warnings.append({"id": "score_range", "index": index, "message": "Candidate score should be normalized 0-1."})
+
+    inputs = plan.get("inputs_used") or []
+    has_transcript = any(((item.get("transcript") or {}).get("available")) for item in inputs)
+    if not has_transcript:
+        warnings.append({"id": "missing_transcript", "message": "No transcript sidecars were used; content selection is weak."})
+    source_warnings = []
+    for item in inputs:
+        preflight = item.get("source_preflight") or {}
+        vfr = preflight.get("vfr") or {}
+        if vfr.get("is_vfr"):
+            source_warnings.append(
+                {
+                    "clip_id": item.get("clip_id"),
+                    "clip_name": item.get("clip_name"),
+                    "severity": vfr.get("severity"),
+                    "message": "Potential VFR source; source-frame math may drift unless conformed/proxied consistently.",
+                }
+            )
+    warnings.extend({"id": "source_preflight", **warning} for warning in source_warnings)
+
+    axes = plan.get("edit_axes") or {}
+    for message in axes.get("warnings") or []:
+        warnings.append({"id": "edit_axes", "message": str(message)})
+    gates = plan.get("quality_gates") or []
+    gate_warnings = [gate for gate in gates if gate.get("status") == "warn"]
+    warnings.extend({"id": f"quality_gate:{gate.get('id')}", "message": gate.get("message")} for gate in gate_warnings)
+
+    valid = not errors
+    return {
+        "success": valid,
+        "valid": valid,
+        "plan_id": plan.get("plan_id"),
+        "schema_version": plan.get("schema_version"),
+        "analysis_depth": plan.get("analysis_depth"),
+        "edit_axes": axes,
+        "error_count": len(errors),
+        "warning_count": len(warnings),
+        "errors": errors,
+        "warnings": warnings,
+        "candidate_counts": plan.get("candidate_counts") or {},
+        "recommendation": (
+            "Plan contract is structurally usable; the skill should apply thresholds and under-cut bias."
+            if valid
+            else "Do not apply this plan until validation errors are fixed."
+        ),
+    }
+
+
 def apply_ai_cut_plan_preview(plan: Dict[str, Any]) -> Dict[str, Any]:
     """Return an application preview.
 
@@ -494,11 +1070,13 @@ def apply_ai_cut_plan_preview(plan: Dict[str, Any]) -> Dict[str, Any]:
     a full assembly edit was made.
     """
 
+    validation = validate_ai_cut_plan_preview(plan)
     return {
         "success": False,
         "implemented": False,
         "plan_id": plan.get("plan_id"),
         "analysis_depth": plan.get("analysis_depth"),
+        "validation": validation,
         "selected_range_count": len(plan.get("selected_ranges") or []),
         "punch_in_count": len(plan.get("punch_ins") or []),
         "cutaway_count": len(plan.get("cutaways") or []),
@@ -512,6 +1090,7 @@ def verify_ai_cut_plan_preview(plan: Dict[str, Any]) -> Dict[str, Any]:
         "success": False,
         "implemented": False,
         "plan_id": plan.get("plan_id"),
+        "validation": validate_ai_cut_plan_preview(plan),
         "expected": {
             "selected_ranges": len(plan.get("selected_ranges") or []),
             "punch_ins": len(plan.get("punch_ins") or []),
@@ -575,6 +1154,40 @@ def _num(value: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "N/A":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == "N/A":
+            return None
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def _rate_to_float(value: Any) -> Optional[float]:
+    text = str(value or "").strip()
+    if not text or text == "0/0":
+        return None
+    if "/" in text:
+        left, right = text.split("/", 1)
+        den = _safe_float(right)
+        if not den:
+            return None
+        num = _safe_float(left)
+        if num is None:
+            return None
+        return num / den
+    return _safe_float(text)
+
+
 def _filler_penalty(text: str) -> float:
     lower = str(text or "").lower()
     penalty = 0.0
@@ -582,6 +1195,211 @@ def _filler_penalty(text: str) -> float:
         if filler in lower:
             penalty += 0.025
     return min(0.15, penalty)
+
+
+def _style_fit_for_line(text: str, word_count: int, has_action: bool, style_key: str, profile: Dict[str, Any]) -> Dict[str, Any]:
+    tokens = set(_tokens(text))
+    low, high = profile.get("ideal_line_words") or (6, 40)
+    adjustment = 0.0
+    reasons: List[str] = []
+    if low <= word_count <= high:
+        adjustment += 0.04
+        reasons.append("line length fits style")
+    elif word_count > high:
+        if profile.get("prefer_short_lines"):
+            adjustment -= min(0.12, (word_count - high) * 0.006)
+            reasons.append("longer than this style prefers")
+        else:
+            adjustment -= min(0.05, (word_count - high) * 0.002)
+            reasons.append("long line; review pacing")
+    elif word_count < low:
+        adjustment -= 0.03
+        reasons.append("short fragment; may need context")
+    if profile.get("prefer_motion") and has_action:
+        adjustment += 0.04
+        reasons.append("visual motion supports energetic cut")
+    if style_key == "promo" and tokens & _PROMO_TERMS:
+        adjustment += 0.08
+        reasons.append("promo/CTA language")
+    if style_key == "fast_hype" and tokens & _HYPE_TERMS:
+        adjustment += 0.08
+        reasons.append("hype/action language")
+    if style_key == "interview_doc" and tokens & _INTERVIEW_TERMS:
+        adjustment += 0.06
+        reasons.append("story/emotion language")
+    if style_key == "sermon_event":
+        adjustment += 0.02
+        reasons.append("chronological/event candidate; skill should preserve order")
+    return {
+        "style_key": style_key,
+        "word_count": int(word_count),
+        "ideal_word_range": [int(low), int(high)],
+        "reasons": reasons,
+        "score_adjustment": round(adjustment, 4),
+    }
+
+
+def _annotate_redundancy_groups(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    groups: List[Dict[str, Any]] = []
+    assigned: set[int] = set()
+    token_sets = [set(_tokens(item.get("text") or "")) for item in candidates]
+    for index, tokens in enumerate(token_sets):
+        if index in assigned or len(tokens) < 3:
+            continue
+        members = [index]
+        for other_index in range(index + 1, len(candidates)):
+            if other_index in assigned:
+                continue
+            other = token_sets[other_index]
+            if len(other) < 3:
+                continue
+            union = tokens | other
+            if not union:
+                continue
+            similarity = len(tokens & other) / len(union)
+            containment = len(tokens & other) / max(1, min(len(tokens), len(other)))
+            if similarity >= 0.48 or containment >= 0.72:
+                members.append(other_index)
+        if len(members) < 2:
+            continue
+        group_id = f"redundant_{len(groups) + 1:03d}"
+        ranked = sorted(members, key=lambda idx: candidates[idx].get("score") or 0.0, reverse=True)
+        for rank, member_index in enumerate(ranked, start=1):
+            candidates[member_index]["redundancy_group_id"] = group_id
+            candidates[member_index]["redundancy_rank"] = rank
+        assigned.update(members)
+        best = candidates[ranked[0]]
+        groups.append(
+            {
+                "group_id": group_id,
+                "candidate_count": len(members),
+                "recommended_keep_count": 1,
+                "decision_owner": "assistant-editor skill",
+                "top_candidate": {
+                    "clip_id": best.get("clip_id"),
+                    "source_in": best.get("source_in"),
+                    "source_out": best.get("source_out"),
+                    "score": best.get("score"),
+                    "text": best.get("text"),
+                },
+                "candidates": [
+                    {
+                        "clip_id": candidates[idx].get("clip_id"),
+                        "source_in": candidates[idx].get("source_in"),
+                        "source_out": candidates[idx].get("source_out"),
+                        "score": candidates[idx].get("score"),
+                        "text": candidates[idx].get("text"),
+                    }
+                    for idx in ranked
+                ],
+                "note": "Likely repeated idea. The MCP ranks options; the skill decides whether repetition is intentional.",
+            }
+        )
+    return groups
+
+
+def _quality_gates_for_plan(
+    *,
+    style_key: str,
+    target_duration: str,
+    analysis_depth: str,
+    candidate_counts: Dict[str, int],
+    selected_ranges: Sequence[Dict[str, Any]],
+    punch_ins: Sequence[Dict[str, Any]],
+    cutaways: Sequence[Dict[str, Any]],
+    redundancy_groups: Sequence[Dict[str, Any]],
+    clip_roles: Sequence[Dict[str, Any]],
+    inputs_used: Sequence[Dict[str, Any]],
+    edit_axes: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    profile = _style_profile(style_key)
+    gates: List[Dict[str, Any]] = []
+    gates.append(
+        {
+            "id": "style_target",
+            "status": "pass",
+            "message": f"Plan scored for {style_key}.",
+            "detail": profile.get("selection_bias"),
+        }
+    )
+    axes = edit_axes or {}
+    gates.append(
+        {
+            "id": "edit_axes",
+            "status": "warn" if axes.get("warnings") else "pass",
+            "message": (
+                f"{axes.get('content_type', 'unknown')} / {axes.get('cut_intent', 'unknown')} "
+                f"using {axes.get('selection_strategy', 'unknown')} strategy."
+            ),
+            "detail": axes.get("warnings") or [],
+        }
+    )
+    has_transcript = any(((item.get("transcript") or {}).get("available")) for item in inputs_used)
+    gates.append(
+        {
+            "id": "transcript_basis",
+            "status": "pass" if has_transcript else "warn",
+            "message": "Transcript sidecars available for content selection." if has_transcript else "No transcript sidecars; content selection is weak.",
+        }
+    )
+    has_deep = "deep_visual" in str(analysis_depth)
+    if style_key in {"interview_doc", "promo"}:
+        gates.append(
+            {
+                "id": "deep_visual_context",
+                "status": "pass" if has_deep else "warn",
+                "message": "Deep VLM context is available." if has_deep else "Deep VLM context missing; story/context judgment should be conservative.",
+            }
+        )
+    if profile.get("needs_punch_ins"):
+        gates.append(
+            {
+                "id": "punch_in_coverage",
+                "status": "pass" if len(punch_ins) >= 3 else "warn",
+                "message": f"{len(punch_ins)} punch-in candidates found.",
+                "minimum_expected": 3,
+            }
+        )
+    if profile.get("needs_cutaways"):
+        gates.append(
+            {
+                "id": "coverage_cutaways",
+                "status": "pass" if len(cutaways) > 0 else "warn",
+                "message": f"{len(cutaways)} cutaway/context candidates found.",
+            }
+        )
+    gates.append(
+        {
+            "id": "redundancy_review",
+            "status": "warn" if redundancy_groups else "pass",
+            "message": f"{len(redundancy_groups)} repeated-idea group(s) need skill thresholding." if redundancy_groups else "No obvious repeated-idea groups detected.",
+        }
+    )
+    gates.append(
+        {
+            "id": "candidate_depth",
+            "status": "pass" if candidate_counts.get("selected_ranges", 0) >= 3 else "warn",
+            "message": f"{candidate_counts.get('selected_ranges', 0)} selected-range candidates found.",
+        }
+    )
+    if target_duration:
+        gates.append(
+            {
+                "id": "target_duration_declared",
+                "status": "pass",
+                "message": f"Target duration declared: {target_duration}. Skill should apply final density/runtime thresholds.",
+            }
+        )
+    roles = {str(item.get("role") or "") for item in clip_roles}
+    if style_key in {"promo", "fast_hype"} and roles <= {"main_take", "main_take_with_context"}:
+        gates.append(
+            {
+                "id": "visual_variety",
+                "status": "warn",
+                "message": "Only main-take roles detected; promo/hype edits may need more coverage or stronger punch-ins.",
+            }
+        )
+    return gates
 
 
 def _nearest_event(events: Sequence[Dict[str, Any]], frame: int, max_distance: int) -> Optional[Dict[str, Any]]:

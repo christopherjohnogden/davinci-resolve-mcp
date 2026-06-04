@@ -264,7 +264,7 @@ def stage_file_to_runpod_network_volume(
     api_key_env: str = DEFAULT_RUNPOD_API_KEY_ENV,
     timeout: float = 30.0,
 ) -> Optional[Dict[str, Any]]:
-    """Stage a local source copy onto a configured RunPod network volume."""
+    """Stage a local analysis input onto a configured RunPod network volume."""
 
     config = resolve_runpod_network_volume_config(
         network_volume_id=network_volume_id,
@@ -276,8 +276,12 @@ def stage_file_to_runpod_network_volume(
     )
     if not config:
         return None
+    path = Path(file_path).expanduser()
+    size: Optional[int] = None
+    if path.exists() and path.is_file():
+        size = int(path.stat().st_size)
     object_key = runpod_staging_object_key(
-        file_path=file_path,
+        file_path=str(path),
         project_name=project_name,
         media_id=media_id,
         remote_prefix=remote_prefix or config.get("remote_prefix"),
@@ -287,6 +291,8 @@ def stage_file_to_runpod_network_volume(
         return {
             "dry_run": True,
             "would_upload": True,
+            "file_path": str(path),
+            "size_bytes": size,
             "network_volume_id": config["network_volume_id"],
             "data_center_id": config["data_center_id"],
             "s3_endpoint_url": config["s3_endpoint_url"],

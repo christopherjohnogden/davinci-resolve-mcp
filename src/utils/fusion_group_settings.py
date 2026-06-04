@@ -67,7 +67,7 @@ class InstanceInputSummary:
 # bounds of a block.
 _FIELD_RE = re.compile(r'(\w+)\s*=\s*(?:"([^"]*)"|([\d.eE+-]+))')
 
-_INPUT_HEAD_RE = re.compile(r"(Input\d+)\s*=\s*InstanceInput\s*\{")
+_INPUT_HEAD_RE = re.compile(r"([A-Za-z_]\w*)\s*=\s*InstanceInput\s*\{")
 
 
 def _find_balanced_brace(text: str, open_index: int) -> int:
@@ -163,10 +163,10 @@ def parse_instance_input_block(inputs_inner: str) -> List[InstanceInputSummary]:
 
 
 def _slot_key(slot: str) -> int:
-    try:
-        return int(slot.replace("Input", ""))
-    except ValueError:
-        return 9999
+    match = re.fullmatch(r"Input(\d+)", slot)
+    if match:
+        return int(match.group(1))
+    return 9999
 
 
 def _group_inputs_span(

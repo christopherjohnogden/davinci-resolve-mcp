@@ -1,0 +1,665 @@
+{
+	Tools = ordered() {
+		TwelveStoneNamePlate = GroupOperator {
+			CtrlWZoom = false,
+			CustomData = { Path = { Map = { ["Setting:"] = "Templates:/Edit/Titles/12Stone/" } } },
+			Inputs = ordered() {
+				FirstNameTextInput = InstanceInput {
+					SourceOp = "FirstNameSource",
+					Source = "StyledText",
+					Name = "First Name",
+					Page = "Name",
+					Default = 0,
+				},
+				LastNameTextInput = InstanceInput {
+					SourceOp = "LastNameSource",
+					Source = "StyledText",
+					Name = "Last Name",
+					Page = "Name",
+					Default = 0,
+				},
+				LastNameSpacing = InstanceInput {
+					SourceOp = "NameSpacingCtrl",
+					Source = "Value",
+					Name = "Last Name Spacing",
+					Page = "Name",
+					Default = 0,
+				},
+				TitleTextInput = InstanceInput {
+					SourceOp = "TitleTextSource",
+					Source = "StyledText",
+					Name = "Title",
+					Page = "Name",
+					Default = 0,
+				},
+				NameColorRed = InstanceInput {
+					SourceOp = "LT_Jason",
+					Source = "Red1",
+					Name = "Name Color",
+					ControlGroup = 1,
+					Page = "Name",
+					Default = 1,
+				},
+				NameColorGreen = InstanceInput {
+					SourceOp = "LT_Jason",
+					Source = "Green1",
+					ControlGroup = 1,
+					Page = "Name",
+					Default = 1,
+				},
+				NameColorBlue = InstanceInput {
+					SourceOp = "LT_Jason",
+					Source = "Blue1",
+					ControlGroup = 1,
+					Page = "Name",
+					Default = 1,
+				},
+				NameColorAlpha = InstanceInput {
+					SourceOp = "LT_Jason",
+					Source = "Alpha1",
+					ControlGroup = 1,
+					Page = "Name",
+					Default = 1,
+				},
+				TitleColorRed = InstanceInput {
+					SourceOp = "LT_Title",
+					Source = "Red1",
+					Name = "Title Color",
+					ControlGroup = 2,
+					Page = "Name",
+					Default = 0.168627,
+				},
+				TitleColorGreen = InstanceInput {
+					SourceOp = "LT_Title",
+					Source = "Green1",
+					ControlGroup = 2,
+					Page = "Name",
+					Default = 0.462745,
+				},
+				TitleColorBlue = InstanceInput {
+					SourceOp = "LT_Title",
+					Source = "Blue1",
+					ControlGroup = 2,
+					Page = "Name",
+					Default = 0.941176,
+				},
+				TitleColorAlpha = InstanceInput {
+					SourceOp = "LT_Title",
+					Source = "Alpha1",
+					ControlGroup = 2,
+					Page = "Name",
+					Default = 1,
+				},
+				TextShadowStrength = InstanceInput {
+					SourceOp = "DropShadow1",
+					Source = "shadowStrength",
+					Name = "Text Drop Shadow Alpha",
+					Page = "Name",
+					Default = 0,
+				},
+				TextShadowDistance = InstanceInput {
+					SourceOp = "DropShadow1",
+					Source = "ShadowDistance",
+					Name = "Text Drop Shadow Distance",
+					Page = "Name",
+					Default = 0.0094,
+				},
+				TextShadowBlur = InstanceInput {
+					SourceOp = "DropShadow1",
+					Source = "shadowBlur",
+					Name = "Text Drop Shadow Blur",
+					Page = "Name",
+					Default = 0.307,
+				},
+				BGColorRed = InstanceInput {
+					SourceOp = "LT_BG",
+					Source = "TopLeftRed",
+					Name = "BG Color",
+					ControlGroup = 10,
+					Page = "BG",
+					Default = 0.156863,
+				},
+				BGColorGreen = InstanceInput {
+					SourceOp = "LT_BG",
+					Source = "TopLeftGreen",
+					ControlGroup = 10,
+					Page = "BG",
+					Default = 0.156863,
+				},
+				BGColorBlue = InstanceInput {
+					SourceOp = "LT_BG",
+					Source = "TopLeftBlue",
+					ControlGroup = 10,
+					Page = "BG",
+					Default = 0.156863,
+				},
+				BGAlpha = InstanceInput {
+					SourceOp = "LT_BG",
+					Source = "TopLeftAlpha",
+					Name = "BG Alpha",
+					Page = "BG",
+					Default = 1,
+				},
+				BGBoxWidth = InstanceInput {
+					SourceOp = "BGBoxWidthCtrl",
+					Source = "Value",
+					Name = "BG Box Width",
+					Page = "BG",
+					Default = 0.409,
+				},
+				Position = InstanceInput {
+					SourceOp = "MoveAll",
+					Source = "Center",
+					Name = "Position",
+					Page = "Asset Move",
+					DefaultX = 0.5,
+					DefaultY = 0.5,
+				}
+			},
+			Outputs = {
+				MainOutput1 = InstanceOutput {
+					SourceOp = "MoveAll",
+					Source = "Output",
+				}
+			},
+			ViewInfo = GroupInfo {
+				Pos = { 220, 49.5 },
+				Flags = {
+					Expanded = true,
+					AllowPan = false,
+					AutoSnap = true,
+					RemoveRouters = true
+				},
+				Size = { 987.938, 359.663, 493.969, 24.2424 },
+				Direction = "Horizontal",
+				PipeStyle = "Direct",
+				Scale = 1,
+				Offset = { 0, 0 }
+			},
+			Tools = ordered() {
+		FirstNameSource = TextPlus {
+			Inputs = {
+				StyledText = Input { Value = "JASON", },
+			},
+			ViewInfo = OperatorInfo { Pos = { 48, -72 } },
+		},
+		LastNameSource = TextPlus {
+			Inputs = {
+				StyledText = Input { Value = "BERRY", },
+			},
+			ViewInfo = OperatorInfo { Pos = { 48, -24 } },
+		},
+		TitleTextSource = TextPlus {
+			Inputs = {
+				StyledText = Input { Value = "SENIOR PASTOR", },
+			},
+			ViewInfo = OperatorInfo { Pos = { 48, 24 } },
+		},
+		NameSpacingCtrl = PublishNumber {
+			Inputs = {
+				Value = Input { Value = 0, },
+				Comments = Input { Value = "Moves the last name horizontally. Positive values move it right.", },
+				UserControls = ordered() {
+					Value = {
+						LINKS_Name = "Last Name Spacing",
+						LINKID_DataType = "Number",
+						INPID_InputControl = "SliderControl",
+						INP_Default = 0,
+						INP_Integer = false,
+						INP_MinScale = -150,
+						INP_MaxScale = 250,
+						INP_MinAllowed = -300,
+						INP_MaxAllowed = 500,
+					}
+				},
+			},
+			ViewInfo = OperatorInfo { Pos = { 208, 140 } },
+		},
+		BGBoxWidthCtrl = PublishNumber {
+			Inputs = {
+				Value = Input { Value = 0.409, },
+				Comments = Input { Value = "Sets the final width of the animated BG box.", },
+				UserControls = ordered() {
+					Value = {
+						LINKS_Name = "BG Box Width",
+						LINKID_DataType = "Number",
+						INPID_InputControl = "SliderControl",
+						INP_Default = 0.409,
+						INP_Integer = false,
+						INP_MinScale = 0.1,
+						INP_MaxScale = 0.95,
+						INP_MinAllowed = 0.1,
+						INP_MaxAllowed = 0.95,
+					}
+				},
+			},
+			ViewInfo = OperatorInfo { Pos = { 208, 250.46 } },
+		},
+		BGRect = RectangleMask {
+			Inputs = {
+				Filter = Input { Value = FuID { "Fast Gaussian" }, },
+				MaskWidth = Input { Value = 1920, },
+				MaskHeight = Input { Value = 1080, },
+				PixelAspect = Input { Value = { 1, 1 }, },
+				ClippingMode = Input { Value = FuID { "None" }, },
+				Center = Input { Value = { 0.2625, 0.45 }, Expression = "Point(0.058 + BGRect.Width/2, 0.450)", },
+				Width = Input {
+					SourceOp = "BGRectWidthCalc",
+					Source = "Result",
+				},
+				Height = Input { Value = 0.145, },
+			},
+			ViewInfo = OperatorInfo { Pos = { 354, 250.46 } },
+		},
+		BGRectWidthCalc = Calculation {
+			CtrlWZoom = false,
+			Inputs = {
+				FirstOperand = Input {
+					SourceOp = "BGRectReveal",
+					Source = "Value",
+				},
+				Operator = Input { Value = 2, },
+				SecondOperand = Input {
+					SourceOp = "BGBoxWidthCtrl",
+					Source = "Value",
+				},
+			},
+			ViewInfo = OperatorInfo { Pos = { 354, 306 } },
+		},
+		BGRectReveal = BezierSpline {
+			SplineColor = { Red = 255, Green = 220, Blue = 0 },
+			CtrlWZoom = false,
+			NameSet = true,
+			KeyFrames = {
+				[0] = { 0, RH = { 9.33333333333333, 0.333333333333333 }, Flags = { Linear = true } },
+				[28] = { 1, LH = { 18.6666666666667, 0.666666666666667 }, RH = { 46.6666666666667, 1 }, Flags = { Linear = true } },
+				[84] = { 1, LH = { 65.3333333333333, 1 }, RH = { 93.3333333333333, 0.666666666666667 }, Flags = { Linear = true } },
+				[112] = { 0, LH = { 102.666666666667, 0.333333333333333 }, Flags = { Linear = true } }
+			}
+		},
+		LT_BG = Background {
+			Inputs = {
+				GlobalOut = Input { Value = 119, },
+				Width = Input { Value = 1920, },
+				Height = Input { Value = 1080, },
+				UseFrameFormatSettings = Input { Value = 1, },
+				["Gamut.SLogVersion"] = Input { Value = FuID { "SLog2" }, },
+				EffectMask = Input {
+					SourceOp = "BGRect",
+					Source = "Mask",
+				},
+				TopLeftRed = Input { Value = 0.156863, },
+				TopLeftGreen = Input { Value = 0.156863, },
+				TopLeftBlue = Input { Value = 0.156863, },
+				TopLeftAlpha = Input { Value = 1, }
+			},
+			ViewInfo = OperatorInfo { Pos = { 507.154, 250.46 } },
+		},
+		LT_Jason = TextPlus {
+			Inputs = {
+				GlobalOut = Input { Value = 119, },
+				Width = Input { Value = 1920, },
+				Height = Input { Value = 1080, },
+				UseFrameFormatSettings = Input { Value = 1, },
+				["Gamut.SLogVersion"] = Input { Value = FuID { "SLog2" }, },
+				Wrap = Input { Value = 1, },
+				Center = Input { Value = { 0.135, 0.47 }, },
+				LayoutRotation = Input { Value = 1, },
+				TransformRotation = Input { Value = 1, },
+				Red1 = Input { Value = 1, },
+				Green1 = Input { Value = 1, },
+				Blue1 = Input { Value = 1, },
+				Alpha1 = Input { Value = 1, },
+				Softness1 = Input { Value = 1, },
+				StyledText = Input { Value = "JASON", Expression = "string.upper(tostring(FirstNameSource.StyledText.Value))", },
+				Font = Input { Value = "Brandon Grotesque", },
+				Style = Input { Value = "Bold", },
+				Size = Input { Value = 0.072, },
+				VerticalJustificationNew = Input { Value = 3, },
+				HorizontalJustificationNew = Input { Value = 3, }
+			},
+			ViewInfo = OperatorInfo { Pos = { 513.303, -2.64968 } },
+		},
+		LT_JasonXf = Transform {
+			Inputs = {
+				Center = Input {
+					SourceOp = "XYPath3",
+					Source = "Value",
+				},
+				Input = Input {
+					SourceOp = "LT_Jason",
+					Source = "Output",
+				}
+			},
+			ViewInfo = OperatorInfo { Pos = { 508.447, 95.2905 } },
+		},
+		XYPath3 = XYPath {
+			ShowKeyPoints = false,
+			DrawMode = "ModifyOnly",
+			CtrlWZoom = false,
+			Inputs = {
+				X = Input {
+					SourceOp = "XYPath3X",
+					Source = "Value",
+				},
+				Y = Input {
+					SourceOp = "XYPath3Y",
+					Source = "Value",
+				}
+			},
+		},
+		XYPath3X = BezierSpline {
+			SplineColor = { Red = 255, Green = 0, Blue = 0 },
+			CtrlWZoom = false,
+			NameSet = true,
+			KeyFrames = {
+				[0] = { 0.482, RH = { 4, 0.488 }, Flags = { Linear = true } },
+				[12] = { 0.5, LH = { 8, 0.494 }, RH = { 38, 0.5 }, Flags = { Linear = true } },
+				[90] = { 0.5, LH = { 64, 0.5 }, RH = { 94, 0.508333333333333 }, Flags = { Linear = true } },
+				[102] = { 0.525, LH = { 98, 0.516666666666667 }, Flags = { Linear = true } }
+			}
+		},
+		XYPath3Y = BezierSpline {
+			SplineColor = { Red = 0, Green = 255, Blue = 0 },
+			CtrlWZoom = false,
+			NameSet = true,
+			KeyFrames = {
+				[0] = { 0.5, RH = { 4, 0.5 }, Flags = { Linear = true } },
+				[12] = { 0.5, LH = { 8, 0.5 }, RH = { 38, 0.5 }, Flags = { Linear = true } },
+				[90] = { 0.5, LH = { 64, 0.5 }, RH = { 94, 0.5 }, Flags = { Linear = true } },
+				[102] = { 0.5, LH = { 98, 0.5 }, Flags = { Linear = true } }
+			}
+		},
+		LT_M1 = Merge {
+			Inputs = {
+				EffectMask = Input {
+					SourceOp = "BGRect",
+					Source = "Mask",
+				},
+				Blend = Input {
+					SourceOp = "LT_M1Blend",
+					Source = "Value",
+				},
+				Background = Input {
+					SourceOp = "LT_BG",
+					Source = "Output",
+				},
+				Foreground = Input {
+					SourceOp = "LT_JasonXf",
+					Source = "Output",
+				},
+				PerformDepthMerge = Input { Value = 0, }
+			},
+			ViewInfo = OperatorInfo { Pos = { 507.311, 167.417 } },
+		},
+		LT_M1Blend = BezierSpline {
+			SplineColor = { Red = 205, Green = 205, Blue = 205 },
+			CtrlWZoom = false,
+			KeyFrames = {
+				[0] = { 0, RH = { 4, 0.333333333333333 }, Flags = { Linear = true } },
+				[12] = { 1, LH = { 8, 0.666666666666667 }, RH = { 37.6666666666667, 1 }, Flags = { Linear = true } },
+				[89] = { 1, LH = { 63.3333333333333, 1 }, RH = { 93, 0.666666666666667 }, Flags = { Linear = true } },
+				[101] = { 0, LH = { 97, 0.333333333333333 }, Flags = { Linear = true } }
+			}
+		},
+		LT_Berry = TextPlus {
+			Inputs = {
+				GlobalOut = Input { Value = 119, },
+				Width = Input { Value = 1920, },
+				Height = Input { Value = 1080, },
+				UseFrameFormatSettings = Input { Value = 1, },
+				["Gamut.SLogVersion"] = Input { Value = FuID { "SLog2" }, },
+				Wrap = Input { Value = 1, },
+				Center = Input { Value = { 0.271247311827957, 0.47 }, Expression = "Point(0.271247311827957 + NameSpacingCtrl.Value/1000, 0.47)", },
+				LayoutRotation = Input { Value = 1, },
+				TransformRotation = Input { Value = 1, },
+				Red1 = Input { Value = 1, Expression = "LT_Jason.Red1", },
+				Green1 = Input { Value = 1, Expression = "LT_Jason.Green1", },
+				Blue1 = Input { Value = 1, Expression = "LT_Jason.Blue1", },
+				Alpha1 = Input { Value = 1, Expression = "LT_Jason.Alpha1", },
+				Softness1 = Input { Value = 1, },
+				StyledText = Input { Value = "BERRY", Expression = "string.upper(tostring(LastNameSource.StyledText.Value))", },
+				Font = Input { Value = "Brandon Grotesque", },
+				Style = Input { Value = "Bold", },
+				Size = Input { Value = 0.072, },
+				VerticalJustificationNew = Input { Value = 3, },
+				HorizontalJustificationNew = Input { Value = 3, }
+			},
+			ViewInfo = OperatorInfo { Pos = { 656.473, 0.00748825 } },
+		},
+		LT_BerryXf = Transform {
+			EnabledRegion = TimeRegion { { Start = 0, End = 119.9999, FrameLength = 1 } },
+			Inputs = {
+				Center = Input {
+					SourceOp = "XYPath4",
+					Source = "Value",
+				},
+				Input = Input {
+					SourceOp = "LT_Berry",
+					Source = "Output",
+				}
+			},
+			ViewInfo = OperatorInfo { Pos = { 661.485, 95.2905 } },
+		},
+		XYPath4 = XYPath {
+			ShowKeyPoints = false,
+			DrawMode = "ModifyOnly",
+			CtrlWZoom = false,
+			Inputs = {
+				X = Input {
+					SourceOp = "XYPath4X",
+					Source = "Value",
+				},
+				Y = Input {
+					SourceOp = "XYPath4Y",
+					Source = "Value",
+				}
+			},
+		},
+		XYPath4X = BezierSpline {
+			SplineColor = { Red = 255, Green = 0, Blue = 0 },
+			CtrlWZoom = false,
+			NameSet = true,
+			KeyFrames = {
+				[8] = { 0.482, RH = { 12, 0.488 }, Flags = { Linear = true } },
+				[20] = { 0.5, LH = { 16, 0.494 }, RH = { 42.3333333333333, 0.5 }, Flags = { Linear = true } },
+				[87] = { 0.5, LH = { 64.6666666666667, 0.5 }, RH = { 91, 0.508333333333333 }, Flags = { Linear = true } },
+				[99] = { 0.525, LH = { 95, 0.516666666666667 }, Flags = { Linear = true } }
+			}
+		},
+		XYPath4Y = BezierSpline {
+			SplineColor = { Red = 0, Green = 255, Blue = 0 },
+			CtrlWZoom = false,
+			NameSet = true,
+			KeyFrames = {
+				[8] = { 0.5, RH = { 12, 0.5 }, Flags = { Linear = true } },
+				[20] = { 0.5, LH = { 16, 0.5 }, RH = { 42.3333333333333, 0.5 }, Flags = { Linear = true } },
+				[87] = { 0.5, LH = { 64.6666666666667, 0.5 }, RH = { 91, 0.5 }, Flags = { Linear = true } },
+				[99] = { 0.5, LH = { 95, 0.5 }, Flags = { Linear = true } }
+			}
+		},
+		LT_M2 = Merge {
+			Inputs = {
+				EffectMask = Input {
+					SourceOp = "BGRect",
+					Source = "Mask",
+				},
+				Blend = Input {
+					SourceOp = "LT_M2Blend",
+					Source = "Value",
+				},
+				Background = Input {
+					SourceOp = "LT_M1",
+					Source = "Output",
+				},
+				Foreground = Input {
+					SourceOp = "LT_BerryXf",
+					Source = "Output",
+				},
+				PerformDepthMerge = Input { Value = 0, }
+			},
+			ViewInfo = OperatorInfo { Pos = { 658.593, 167.417 } },
+		},
+		LT_M2Blend = BezierSpline {
+			SplineColor = { Red = 205, Green = 205, Blue = 205 },
+			CtrlWZoom = false,
+			KeyFrames = {
+				[6] = { 0, RH = { 10, 0.333333333333333 }, Flags = { Linear = true } },
+				[18] = { 1, LH = { 14, 0.666666666666667 }, RH = { 32, 1 }, Flags = { Linear = true } },
+				[60] = { 1, LH = { 46, 1 }, RH = { 69, 1 }, Flags = { Linear = true } },
+				[87] = { 1, LH = { 78, 1 }, RH = { 91, 0.666666666666667 }, Flags = { Linear = true } },
+				[99] = { 0, LH = { 95, 0.333333333333333 }, Flags = { Linear = true } }
+			}
+		},
+		LT_Title = TextPlus {
+			Inputs = {
+				GlobalOut = Input { Value = 119, },
+				Width = Input { Value = 1920, },
+				Height = Input { Value = 1080, },
+				UseFrameFormatSettings = Input { Value = 1, },
+				["Gamut.SLogVersion"] = Input { Value = FuID { "SLog2" }, },
+				Wrap = Input { Value = 1, },
+				Center = Input { Value = { 0.12802688172043, 0.418384321223709 }, },
+				LayoutRotation = Input { Value = 1, },
+				TransformRotation = Input { Value = 1, },
+				Red1 = Input { Value = 0.168627, },
+				Green1 = Input { Value = 0.462745, },
+				Blue1 = Input { Value = 0.941176, },
+				Alpha1 = Input { Value = 1, },
+				Softness1 = Input { Value = 1, },
+				StyledText = Input { Value = "SENIOR PASTOR", Expression = "string.upper(tostring(TitleTextSource.StyledText.Value))", },
+				Font = Input { Value = "Bebas Neue", },
+				Style = Input { Value = "Bold", },
+				Size = Input { Value = 0.034, },
+				VerticalJustificationNew = Input { Value = 3, },
+				HorizontalJustificationNew = Input { Value = 3, }
+			},
+			ViewInfo = OperatorInfo { Pos = { 815.454, 0.269272 } },
+		},
+		LT_TitleXf = Transform {
+			Inputs = {
+				Center = Input {
+					SourceOp = "XYPath5",
+					Source = "Value",
+				},
+				Input = Input {
+					SourceOp = "LT_Title",
+					Source = "Output",
+				}
+			},
+			ViewInfo = OperatorInfo { Pos = { 815.403, 100.081 } },
+		},
+		XYPath5 = XYPath {
+			ShowKeyPoints = false,
+			DrawMode = "ModifyOnly",
+			CtrlWZoom = false,
+			Inputs = {
+				X = Input {
+					SourceOp = "XYPath5X",
+					Source = "Value",
+				},
+				Y = Input {
+					SourceOp = "XYPath5Y",
+					Source = "Value",
+				}
+			},
+		},
+		XYPath5X = BezierSpline {
+			SplineColor = { Red = 255, Green = 0, Blue = 0 },
+			CtrlWZoom = false,
+			NameSet = true,
+			KeyFrames = {
+				[16] = { 0.482, RH = { 20, 0.488 }, Flags = { Linear = true } },
+				[28] = { 0.5, LH = { 24, 0.494 }, RH = { 46.6666666666667, 0.5 }, Flags = { Linear = true } },
+				[84] = { 0.5, LH = { 65.3333333333333, 0.5 }, RH = { 88, 0.508333333333333 }, Flags = { Linear = true } },
+				[96] = { 0.525, LH = { 92, 0.516666666666667 }, Flags = { Linear = true } }
+			}
+		},
+		XYPath5Y = BezierSpline {
+			SplineColor = { Red = 0, Green = 255, Blue = 0 },
+			CtrlWZoom = false,
+			NameSet = true,
+			KeyFrames = {
+				[16] = { 0.5, RH = { 20, 0.5 }, Flags = { Linear = true } },
+				[28] = { 0.5, LH = { 24, 0.5 }, RH = { 46.6666666666667, 0.5 }, Flags = { Linear = true } },
+				[84] = { 0.5, LH = { 65.3333333333333, 0.5 }, RH = { 88, 0.5 }, Flags = { Linear = true } },
+				[96] = { 0.5, LH = { 92, 0.5 }, Flags = { Linear = true } }
+			}
+		},
+		LT_M3 = Merge {
+			Inputs = {
+				EffectMask = Input {
+					SourceOp = "BGRect",
+					Source = "Mask",
+				},
+				Blend = Input {
+					SourceOp = "LT_M3Blend",
+					Source = "Value",
+				},
+				Background = Input {
+					SourceOp = "LT_M2",
+					Source = "Output",
+				},
+				Foreground = Input {
+					SourceOp = "LT_TitleXf",
+					Source = "Output",
+				},
+				PerformDepthMerge = Input { Value = 0, }
+			},
+			ViewInfo = OperatorInfo { Pos = { 813.389, 166.618 } },
+		},
+		LT_M3Blend = BezierSpline {
+			SplineColor = { Red = 205, Green = 205, Blue = 205 },
+			CtrlWZoom = false,
+			KeyFrames = {
+				[16] = { 0, RH = { 20, 0.333333333333333 }, Flags = { Linear = true } },
+				[28] = { 1, LH = { 24, 0.666666666666667 }, RH = { 38.6666666666667, 1 }, Flags = { Linear = true } },
+				[60] = { 1, LH = { 49.3333333333333, 1 }, RH = { 68, 1 }, Flags = { Linear = true } },
+				[84] = { 1, LH = { 76, 1 }, RH = { 88, 0.666666666666667 }, Flags = { Linear = true } },
+				[96] = { 0, LH = { 92, 0.333333333333333 }, Flags = { Linear = true } }
+			}
+		},
+		DropShadow1 = ofx.com.blackmagicdesign.resolvefx.DropShadow {
+			CtrlWShown = false,
+			Inputs = {
+				Source = Input {
+					SourceOp = "LT_M3",
+					Source = "Output",
+				},
+				shadowStrength = Input { Value = 0, },
+				shadowAngle = Input { Value = 31, },
+				ShadowDistance = Input { Value = 0.0094, },
+				shadowBlur = Input { Value = 0.307, },
+				shadowColorRed = Input { Value = 0, },
+				shadowColorGreen = Input { Value = 0, },
+				shadowColorBlue = Input { Value = 0, },
+				isLegacyComp = Input { Value = 0, },
+				blendGroup = Input { Value = 0, },
+				blendIn = Input { Value = 1, },
+				blend = Input { Value = 0, },
+				ignoreContentShape = Input { Value = 0, },
+				legacyIsProcessRGBOnly = Input { Value = 0, },
+				IsNoTemporalFramesReqd = Input { Value = 0, },
+				refreshTrigger = Input { Value = 1, },
+				srcProcessingAlphaMode = Input { Value = 2, },
+				dstProcessingAlphaMode = Input { Value = 2, },
+				resolvefxVersion = Input { Value = "2.0", }
+			},
+			ViewInfo = OperatorInfo { Pos = { 978.389, 166.618 } },
+		},
+		MoveAll = Transform {
+			CtrlWShown = false,
+			Inputs = {
+				Center = Input { Value = { 0.5, 0.5 }, },
+				Input = Input {
+					SourceOp = "DropShadow1",
+					Source = "Output",
+				}
+			},
+			ViewInfo = OperatorInfo { Pos = { 1138.389, 166.618 } },
+		}
+
+			},
+		}
+	}
+}

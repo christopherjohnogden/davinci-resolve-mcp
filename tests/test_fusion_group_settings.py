@@ -255,6 +255,25 @@ class InputBlockParseUnitTest(unittest.TestCase):
         self.assertEqual(parsed[0].source_op, "A")
         self.assertEqual(parsed[2].control_group, 7)
 
+    def test_named_instance_input_slots_parse(self):
+        inputs_inner = """
+            NameTextInput = InstanceInput {
+                SourceOp = "NameText",
+                Source = "StyledText",
+                Name = "Name",
+            },
+            TitleColorRed = InstanceInput {
+                SourceOp = "TitleText",
+                Source = "Red1",
+                Name = "Title Color",
+                ControlGroup = 2,
+            },
+        """
+        parsed = parse_instance_input_block(inputs_inner)
+        self.assertEqual([row.slot for row in parsed], ["NameTextInput", "TitleColorRed"])
+        self.assertEqual(parsed[0].source, "StyledText")
+        self.assertEqual(parsed[1].control_group, 2)
+
 
 class BackupPathTest(unittest.TestCase):
     def test_backup_path_includes_timestamp_and_extension(self):

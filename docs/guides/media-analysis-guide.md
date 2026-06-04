@@ -595,7 +595,23 @@ The matching worker path is:
 
 To test staging without running analysis, call
 `media_analysis(action="runpod_stage_clip", params={"clip_id": "...",
-"dry_run": true})`; set `dry_run=false` to upload the source-safe copy.
+"dry_run": true})`; set `dry_run=false` to upload the selected analysis input.
+For large 4K sources, pass `runpod_use_proxy=true` so the staging test uses the
+same source-safe analysis proxy path as remote visual analysis instead of the
+camera original:
+
+```text
+media_analysis(action="runpod_stage_clip", params={
+  "clip_id": "...",
+  "runpod_use_proxy": true,
+  "runpod_proxy_width": 1920,
+  "dry_run": true
+})
+```
+
+The response includes `source_file_path`, `staged_file_path`,
+`staged_original_source`, and staging `size_bytes` when the staged file already
+exists, so you can verify whether the MCP is sending a proxy or the original.
 
 Use `runpod_wait=false` to submit many clips quickly. Each response includes a
 `runpod_job_id`; later call

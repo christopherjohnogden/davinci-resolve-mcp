@@ -142,10 +142,26 @@ With Resolve open and a media-pool clip available, test the upload path first:
 media_analysis(action="runpod_stage_clip", params={"clip_id":"<clip_id>", "dry_run":true})
 ```
 
+For 4K camera originals, test the proxy path instead:
+
+```text
+media_analysis(action="runpod_stage_clip", params={
+  "clip_id":"<clip_id>",
+  "runpod_use_proxy":true,
+  "runpod_proxy_width":1920,
+  "dry_run":true
+})
+```
+
 If the paths look correct, run:
 
 ```text
-media_analysis(action="runpod_stage_clip", params={"clip_id":"<clip_id>", "dry_run":false})
+media_analysis(action="runpod_stage_clip", params={
+  "clip_id":"<clip_id>",
+  "runpod_use_proxy":true,
+  "runpod_proxy_width":1920,
+  "dry_run":false
+})
 ```
 
 Expected staged paths:
@@ -333,8 +349,10 @@ media_analysis(
   action="plan_ai_cut",
   params={
     "clip_ids":["<clip_id_a>", "<clip_id_b>"],
-    "goal":"short punchy talking-head cut",
-    "style":"clean punchy talking-head"
+    "goal":"Father's Day promo",
+    "style":"promo",
+    "target_duration":"60-90s",
+    "undercut_bias":true
   }
 )
 ```
@@ -344,14 +362,23 @@ The plan includes:
 - `plan_semantics`: declares this is ranked candidate data, not a keep/drop
   decision. The MCP does deterministic scoring; the assistant-editor skill owns
   thresholds, taste, approval rules, and the under-cut bias.
+- `edit_intent`: canonical style key, target duration, under-cut preference, and
+  style notes. Supported style keys are `clean_talking_head`, `punchy_social`,
+  `interview_doc`, `promo`, `fast_hype`, and `sermon_event`.
 - `analysis_depth` and `inputs_used`: whether the plan came from transcript-only,
   transcript+fast visuals, transcript+deep VLM, and whether embeddings were
   available.
 - `clip_roles`: `main_take`, `main_take_with_context`, `establishing`,
   `reaction`, `cutaway`, or `supporting`.
 - `selected_ranges`: transcript-backed source-frame ranges worth keeping.
+  Candidates include `score_breakdown` and `style_fit`; these are scoring
+  evidence for the skill, not final keep/drop commands.
 - `punch_ins`: gesture/expression/motion-backed punch-in frames.
 - `cutaways`: VLM/timeline-backed context or transition ranges.
+- `redundancy_groups`: likely repeated ideas. Usually keep one, but the
+  assistant-editor skill decides if repetition is intentional.
+- `quality_gates`: checklist warnings for thin evidence, missing VLM where the
+  style benefits from it, sparse punch-in/cutaway coverage, and repeated ideas.
 - `candidate_counts`: how many candidates existed before the returned top-N
   limits. Low returned counts mean weak evidence, not an editorial rejection.
 

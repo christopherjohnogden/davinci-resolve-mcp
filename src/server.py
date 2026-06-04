@@ -12,7 +12,7 @@ Usage:
     python src/server.py --full       # Start the 330-tool granular server instead
 """
 
-VERSION = "2.30.11"
+VERSION = "2.30.21"
 
 import base64
 import os
@@ -133,12 +133,13 @@ from src.utils.transcript_analysis import (
 )
 from src.utils.edit_intelligence import (
     ai_cut_plan_path,
-    apply_ai_cut_plan_preview,
     build_transcript_embeddings,
     plan_ai_cut_from_sidecars,
+    probe_source_preflight,
     query_transcript_embeddings,
     read_transcript_embeddings,
     transcript_embeddings_path,
+    validate_ai_cut_plan_preview,
     verify_ai_cut_plan_preview,
 )
 from src.utils.sync_detection import detect_sync_events_for_records as detect_media_sync_events
@@ -843,7 +844,7 @@ _RETRYABLE_UNSET = object()
 
 
 def _err(message, *, code=None, category=None, retryable=_RETRYABLE_UNSET,
-         remediation=None, reason=None):
+         remediation=None, reason=None, details=None):
     """Return a structured error envelope.
 
     Callers may pass just a message string for back-compat with the legacy shape;
@@ -858,7 +859,8 @@ def _err(message, *, code=None, category=None, retryable=_RETRYABLE_UNSET,
 
     Shape:
         {"error": {"message": str, "code": str, "category": str,
-                   "retryable": bool, "reason": str?, "remediation": str?}}
+                   "retryable": bool, "reason": str?, "remediation": str?,
+                   "details": object?}}
     """
     cat = category if category in ERROR_CATEGORIES else "resolve_api_failed"
     if retryable is _RETRYABLE_UNSET:
@@ -875,6 +877,8 @@ def _err(message, *, code=None, category=None, retryable=_RETRYABLE_UNSET,
         body["reason"] = str(reason)
     if remediation:
         body["remediation"] = str(remediation)
+    if details is not None:
+        body["details"] = details
     return {"error": body}
 
 def _ok(**kw):
@@ -15052,6 +15056,7 @@ def _runpod_staging_preview(staging: Optional[Dict[str, Any]]) -> Optional[Dict[
             "object_key",
             "s3_uri",
             "volume_path",
+            "file_path",
             "size_bytes",
         )
         if key in staging
@@ -15504,11 +15509,13 @@ def _ai_cut_clip_payload(clip_id: str) -> Tuple[Optional[Dict[str, Any]], Option
     transcript = read_transcript_sidecar(transcript_path, include_words=False) or {}
     visual = read_visual_sidecar(visual_path, include_frames=False) or {}
     embeddings = read_transcript_embeddings(embeddings_path) or {}
+    source_preflight = probe_source_preflight(context.get("file_path"), expected_fps=context.get("fps"))
     return {
         "clip_id": clip_id,
         "media_id": context["media_id"],
         "clip_name": context["clip_name"],
         "project_name": context["project_name"],
+        "source_preflight": source_preflight,
         "transcript": transcript,
         "visual": visual,
         "transcript_embeddings": embeddings,
@@ -15518,10 +15525,65 @@ def _ai_cut_clip_payload(clip_id: str) -> Tuple[Optional[Dict[str, Any]], Option
     }, None
 
 
+def preflight_ai_cut(clip_ids: List[str]) -> Dict[str, Any]:
+    clips: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    for cid in clip_ids:
+        proj, clip, err = _motion_target_clip(str(cid))
+        if err:
+            errors.append({"clip_id": cid, "error": err.get("error", err)})
+            continue
+        context, context_err = _motion_clip_context(proj, clip)
+        if context_err:
+            errors.append({"clip_id": cid, "error": context_err.get("error", context_err)})
+            continue
+        assert context is not None
+        transcript_path = transcript_sidecar_path(context["project_name"], context["media_id"])
+        visual_path = visual_sidecar_path(context["project_name"], context["media_id"])
+        embeddings_path = transcript_embeddings_path(context["project_name"], context["media_id"])
+        preflight = probe_source_preflight(context.get("file_path"), expected_fps=context.get("fps"))
+        clips.append(
+            {
+                "clip_id": context.get("clip_id") or cid,
+                "media_id": context.get("media_id"),
+                "clip_name": context.get("clip_name"),
+                "file_path": context.get("file_path"),
+                "fps": context.get("fps"),
+                "duration_frames": context.get("duration_frames"),
+                "source_preflight": preflight,
+                "sidecars": {
+                    "transcript": {"exists": transcript_path.exists(), "path": str(transcript_path)},
+                    "visual": {"exists": visual_path.exists(), "path": str(visual_path)},
+                    "embeddings": {"exists": embeddings_path.exists(), "path": str(embeddings_path)},
+                },
+            }
+        )
+    vfr_count = sum(1 for item in clips if (((item.get("source_preflight") or {}).get("vfr") or {}).get("is_vfr")))
+    missing_transcripts = sum(1 for item in clips if not (((item.get("sidecars") or {}).get("transcript") or {}).get("exists")))
+    missing_visuals = sum(1 for item in clips if not (((item.get("sidecars") or {}).get("visual") or {}).get("exists")))
+    return {
+        "success": True,
+        "clip_count": len(clips),
+        "error_count": len(errors),
+        "vfr_clip_count": vfr_count,
+        "missing_transcript_count": missing_transcripts,
+        "missing_visual_count": missing_visuals,
+        "clips": clips,
+        "errors": errors,
+    }
+
+
 def plan_ai_cut(
     clip_ids: List[str],
     goal: str = "short social cut",
     style: str = "clean punchy talking-head",
+    target_duration: str = "",
+    undercut_bias: bool = True,
+    content_type: str = "auto",
+    cut_intent: str = "auto",
+    timeline_mode: str = "raw_dump",
+    takes_already_scrubbed: bool = False,
+    reorder_allowed: bool = True,
     max_ranges: int = 12,
     max_punch_ins: int = 16,
     max_cutaways: int = 12,
@@ -15550,6 +15612,13 @@ def plan_ai_cut(
         clips,
         goal=goal,
         style=style,
+        target_duration=target_duration,
+        undercut_bias=undercut_bias,
+        content_type=content_type,
+        cut_intent=cut_intent,
+        timeline_mode=timeline_mode,
+        takes_already_scrubbed=takes_already_scrubbed,
+        reorder_allowed=reorder_allowed,
         max_ranges=int(max_ranges or 12),
         max_punch_ins=int(max_punch_ins or 16),
         max_cutaways=int(max_cutaways or 12),
@@ -15564,18 +15633,237 @@ def plan_ai_cut(
     return plan
 
 
-def apply_ai_cut_plan(plan_id: Optional[str] = None, plan: Optional[Dict[str, Any]] = None, project_name: Optional[str] = None) -> Dict[str, Any]:
-    """Second-stage cut-plan action.
+def _load_ai_cut_plan_payload(
+    *,
+    plan_id: Optional[str] = None,
+    plan: Optional[Dict[str, Any]] = None,
+    project_name: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    payload = dict(plan or {})
+    if payload:
+        return payload, None
+    if not plan_id:
+        return None, _err("plan_id or plan is required", code="MISSING_PLAN", category="precondition")
+    path = ai_cut_plan_path(project_name or "Project", plan_id)
+    if not path.exists() and project_name is None:
+        try:
+            _pm, proj, err = _check()
+            if not err:
+                name, _pid = _project_name_and_id(proj)
+                path = ai_cut_plan_path(name, plan_id)
+        except Exception:
+            pass
+    if not path.exists():
+        return None, _err(
+            f"Cut plan not found: {plan_id}",
+            code="CUT_PLAN_NOT_FOUND",
+            category="precondition",
+        )
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle), None
 
-    This first pass intentionally returns an application preview. Timeline
-    mutation should be wired once the user confirms how aggressive assembly
-    should be for selected ranges, punch-ins, and cutaways.
-    """
+
+def _ai_cut_timeline_name(plan: Dict[str, Any], requested: Optional[str] = None) -> str:
+    if requested and str(requested).strip():
+        return str(requested).strip()
+    goal = re.sub(r"[^A-Za-z0-9]+", "_", str(plan.get("goal") or "AI_ROUGH_CUT")).strip("_")
+    goal = goal[:32] or "AI_ROUGH_CUT"
+    suffix = str(plan.get("plan_id") or "plan")[-8:]
+    return f"{goal}_AI_ROUGH_CUT_{suffix}"
+
+
+def _ordered_ai_cut_ranges(plan: Dict[str, Any], order_by: str = "auto", min_score: float = 0.0, max_ranges: Optional[int] = None) -> List[Dict[str, Any]]:
+    ranges = [dict(item) for item in (plan.get("selected_ranges") or []) if float(_motion_parse_float(item.get("score"), 0.0) or 0.0) >= float(min_score or 0.0)]
+    if max_ranges and int(max_ranges) > 0:
+        ranges = ranges[: int(max_ranges)]
+    mode = str(order_by or "auto").strip().lower()
+    axes = plan.get("edit_axes") or {}
+    if mode == "auto":
+        if axes.get("reorder_mode") in {"free"} or axes.get("cut_intent") in {"peak_highlight", "assembled_short"}:
+            mode = "score"
+        else:
+            mode = "chronological"
+    if mode == "score":
+        ranges.sort(key=lambda item: float(_motion_parse_float(item.get("score"), 0.0) or 0.0), reverse=True)
+        return ranges
+    clip_order = {
+        str(item.get("clip_id") or ""): index
+        for index, item in enumerate(plan.get("inputs_used") or [])
+    }
+    ranges.sort(
+        key=lambda item: (
+            clip_order.get(str(item.get("clip_id") or ""), 10_000),
+            int(_motion_parse_int(item.get("source_in"), 0)),
+            -float(_motion_parse_float(item.get("score"), 0.0) or 0.0),
+        )
+    )
+    return ranges
+
+
+def _apply_ai_cut_plan_to_timeline(
+    plan: Dict[str, Any],
+    *,
+    timeline_name: Optional[str] = None,
+    if_exists: str = "version",
+    order_by: str = "auto",
+    min_score: float = 0.0,
+    max_ranges: Optional[int] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    validation = validate_ai_cut_plan_preview(plan)
+    if not validation.get("valid"):
+        return {
+            "success": False,
+            "implemented": True,
+            "applied": False,
+            "plan_id": plan.get("plan_id"),
+            "validation": validation,
+            "reason": "Plan validation failed; timeline was not created.",
+        }
+    ranges = _ordered_ai_cut_ranges(plan, order_by=order_by, min_score=min_score, max_ranges=max_ranges)
+    if not ranges:
+        return _err("No selected ranges survived apply filters", code="NO_RANGES_TO_APPLY", category="precondition")
+    clip_infos: List[Dict[str, Any]] = []
+    record = 0
+    for index, item in enumerate(ranges):
+        start = int(_motion_parse_int(item.get("source_in"), 0))
+        end = int(_motion_parse_int(item.get("source_out"), start))
+        if end <= start:
+            continue
+        clip_infos.append(
+            {
+                "clip_id": item.get("clip_id"),
+                "start_frame": start,
+                "end_frame": end,
+                "record_frame": record,
+                "record_frame_mode": "relative",
+                "track_index": 1,
+                "plan_range_index": index,
+                "score": item.get("score"),
+                "text": item.get("text"),
+            }
+        )
+        record += end - start
+    if not clip_infos:
+        return _err("No valid source ranges in plan", code="NO_VALID_RANGES", category="precondition")
+    name = _ai_cut_timeline_name(plan, timeline_name)
+    preview = {
+        "timeline_name": name,
+        "range_count": len(clip_infos),
+        "expected_duration_frames": record,
+        "order_by": order_by,
+        "min_score": min_score,
+        "clip_infos": [
+            {key: value for key, value in info.items() if key != "text"}
+            for info in clip_infos
+        ],
+    }
+    if dry_run:
+        return {
+            "success": True,
+            "implemented": True,
+            "applied": False,
+            "dry_run": True,
+            "plan_id": plan.get("plan_id"),
+            "validation": validation,
+            "preview": preview,
+        }
+
+    _pm, proj, check_err = _check()
+    if check_err:
+        return check_err
+    mp = proj.GetMediaPool()
+    root = mp.GetRootFolder()
+    create_name, existing, policy_result = _resolve_timeline_create_policy(proj, {"name": name, "if_exists": if_exists})
+    if policy_result:
+        return policy_result
+    tl = mp.CreateEmptyTimeline(create_name)
+    if not tl:
+        return _err("Failed to create AI cut timeline", code="TIMELINE_CREATE_FAILED", category="resolve_api_failed")
+    try:
+        proj.SetCurrentTimeline(tl)
+    except Exception:
+        pass
+    timeline_start = _timeline_start_frame(tl)
+    built = []
+    for i, ci in enumerate(clip_infos):
+        row, row_err = _build_append_clip_info_dict(root, ci, i, timeline_start)
+        if row_err:
+            return row_err
+        built.append(row)
+    appended = mp.AppendToTimeline(built)
+    if not appended:
+        return _err("Failed to append AI cut plan ranges to timeline", code="APPEND_FAILED", category="resolve_api_failed")
+    items_out, item_err, warnings = _serialize_append_clip_infos_result(tl, built, appended)
+    if item_err:
+        return item_err
+    summary = _timeline_av_item_counts(tl)
+    expected_video = len(clip_infos)
+    actual_video = int(((summary.get("item_counts") or {}).get("video") or 0))
+    diff = {
+        "expected_video_items": expected_video,
+        "actual_video_items": actual_video,
+        "video_item_delta": actual_video - expected_video,
+        "audio_auto_included": int(((summary.get("item_counts") or {}).get("audio") or 0)) > 0,
+    }
+    return {
+        "success": True,
+        "implemented": True,
+        "applied": True,
+        "plan_id": plan.get("plan_id"),
+        "timeline": {
+            "name": tl.GetName(),
+            "id": tl.GetUniqueId(),
+            "requested_name": name,
+            "versioned_name": bool(existing and create_name != name),
+        },
+        "validation": validation,
+        "applied_range_count": len(clip_infos),
+        "expected_duration_frames": record,
+        "append_return_count": len(appended),
+        "items": items_out or [],
+        "timeline_summary": summary,
+        "verification": {
+            "success": actual_video == expected_video,
+            "diff": diff,
+            "warnings": warnings,
+        },
+        "warnings": warnings,
+    }
+
+
+def apply_ai_cut_plan(
+    plan_id: Optional[str] = None,
+    plan: Optional[Dict[str, Any]] = None,
+    project_name: Optional[str] = None,
+    timeline_name: Optional[str] = None,
+    if_exists: str = "version",
+    order_by: str = "auto",
+    min_score: float = 0.0,
+    max_ranges: Optional[int] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Create a non-destructive AI rough-cut timeline from selected plan ranges."""
+    payload, load_err = _load_ai_cut_plan_payload(plan_id=plan_id, plan=plan, project_name=project_name)
+    if load_err:
+        return load_err
+    assert payload is not None
+    return _apply_ai_cut_plan_to_timeline(
+        payload,
+        timeline_name=timeline_name,
+        if_exists=if_exists,
+        order_by=order_by,
+        min_score=min_score,
+        max_ranges=max_ranges,
+        dry_run=dry_run,
+    )
+
+
+def validate_ai_cut_plan(plan_id: Optional[str] = None, plan: Optional[Dict[str, Any]] = None, project_name: Optional[str] = None) -> Dict[str, Any]:
     payload = dict(plan or {})
     if not payload and plan_id:
         path = ai_cut_plan_path(project_name or "Project", plan_id)
         if not path.exists() and project_name is None:
-            # Try the active project if available.
             try:
                 _pm, proj, err = _check()
                 if not err:
@@ -15592,8 +15880,8 @@ def apply_ai_cut_plan(plan_id: Optional[str] = None, plan: Optional[Dict[str, An
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
     if not payload:
-        return _err("apply_ai_cut_plan requires plan_id or plan", code="MISSING_PLAN", category="precondition")
-    return apply_ai_cut_plan_preview(payload)
+        return _err("validate_ai_cut_plan requires plan_id or plan", code="MISSING_PLAN", category="precondition")
+    return validate_ai_cut_plan_preview(payload)
 
 
 def verify_ai_cut_plan(plan_id: Optional[str] = None, plan: Optional[Dict[str, Any]] = None, project_name: Optional[str] = None) -> Dict[str, Any]:
@@ -15780,7 +16068,7 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
     analyze_motion       -> {analyzed, media_id, sidecar_path, event_count, events_summary}
     get_motion           -> {analyzed, media_id, events, [frames]}
     analyze_clip_visual  -> {analyzed, media_id, sidecar_path, metadata_rollup}; analysis_backend="runpod" can submit remote GPU work
-    runpod_stage_clip    -> upload one clip to the configured RunPod network volume without analyzing
+    runpod_stage_clip    -> stage one clip or analysis proxy to the configured RunPod network volume without analyzing
     runpod_visual_status -> poll/commit a previously submitted RunPod visual job
     runpod_visual_submit_batch -> submit one RunPod visual job per clip_id without waiting
     runpod_visual_deep_keyframes -> submit only selected JPEGs for the deep VLM pass after a fast sidecar exists
@@ -15790,8 +16078,10 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
     get_transcript       -> cached transcript sidecar; never triggers analysis
     analyze_transcript_embeddings -> cached semantic transcript vectors for story/search
     query_transcript_semantic -> meaning search across transcript sidecars
+    preflight_ai_cut   -> source/frame-rate/sidecar readiness checks before planning
     plan_ai_cut         -> scored edit plan from transcript + visual sidecars
-    apply_ai_cut_plan   -> second-stage cut-plan action/preview
+    validate_ai_cut_plan -> deterministic contract/source-risk validation before applying a plan
+    apply_ai_cut_plan   -> create a non-destructive AI rough-cut timeline from selected plan ranges
     verify_ai_cut_plan  -> compare applied timeline against a persisted plan when apply is implemented
     start_batch_job      -> {job_id, status}
     batch_job_status     -> {job_id, status, progress, recent_events, clip_states}
@@ -15818,7 +16108,7 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
       analyze_motion(clip_id, force?, sample_every_n?, proxy_width?, model?) -> cached YOLO Pose source-frame motion analysis under ~/Resolve_Analysis
       get_motion(clip_id, include_frames?) -> read cached source-frame motion events; never runs YOLO
       analyze_clip_visual(clip_id, tier?, force?, sample_every_n?, object_every_n?|object_every_seconds?, batch_size?, dry_run?, analysis_backend?, runpod_use_proxy?) -> source-safe visual analysis + metadata rollup; pass analysis_backend="runpod" for optional remote GPU dispatch
-      runpod_stage_clip(clip_id, dry_run?) -> upload one clip to the configured RunPod network volume and return s3:// plus /runpod-volume paths
+      runpod_stage_clip(clip_id, dry_run?, runpod_use_proxy?, runpod_proxy_width?, runpod_proxy_crf?) -> stage one clip or analysis proxy to the configured RunPod network volume and return s3:// plus /runpod-volume paths
       runpod_visual_submit_batch(clip_ids, ...) -> submit remote visual jobs for multiple clips so RunPod can scale workers in parallel
       runpod_visual_status(clip_id, job_id, wait?) -> poll a RunPod visual job and commit its sidecar/metadata when complete
       runpod_visual_deep_keyframes(clip_id, vlm_model, max_keyframes?, image_width?) -> submit selected JPEGs only for deep VLM after a fast sidecar exists
@@ -15828,8 +16118,10 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
       get_transcript(clip_id, include_words?) -> read cached source-frame transcript; never runs transcription
       analyze_transcript_embeddings(clip_id, force?, dimensions?, window_lines?) -> source-frame transcript semantic vectors
       query_transcript_semantic(clip_ids, query, limit?, auto_build?) -> meaning search over transcript lines
-      plan_ai_cut(clip_ids, goal?, style?) -> choose ranges/punch-ins/cutaways using transcript + visuals
-      apply_ai_cut_plan(plan_id|plan) -> second-stage cut-plan application preview
+      preflight_ai_cut(clip_ids) -> source VFR/offline and transcript/visual/embedding sidecar readiness
+      plan_ai_cut(clip_ids, goal?, style?, target_duration?, undercut_bias?, content_type?, cut_intent?, timeline_mode?) -> scored ranges/punch-ins/cutaways using transcript + visuals
+      validate_ai_cut_plan(plan_id|plan) -> validate plan contract, source preflight, and quality gates
+      apply_ai_cut_plan(plan_id|plan, timeline_name?, dry_run?, order_by?, min_score?, max_ranges?) -> create a non-destructive AI rough-cut timeline from selected ranges
       verify_ai_cut_plan(plan_id|plan) -> verification/diff contract for applied cut plans
       add_sync_event_markers(target?|paths?|detections?, confirm?) -> {added, skipped}
       publish_clip_metadata(target?, fields?, slate_detection?, timed_markers?|write_markers?, dry_run?, confirm?) -> {results}
@@ -16103,16 +16395,34 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
         clip_context, context_err = _motion_clip_context(target_proj, clip)
         if context_err:
             return context_err
+        dry_run = _media_analysis_bool(p.get("dry_run", p.get("dryRun")), False)
+        stage_file_path = str(clip_context["file_path"])
+        analysis_proxy: Optional[Dict[str, Any]] = None
+        if _media_analysis_bool(p.get("runpod_use_proxy", p.get("runpodUseProxy")), False):
+            proxy_result = _ensure_runpod_analysis_proxy(
+                clip_context,
+                width=int(p.get("runpod_proxy_width", p.get("runpodProxyWidth", 1920)) or 1920),
+                crf=int(p.get("runpod_proxy_crf", p.get("runpodProxyCrf", 30)) or 30),
+                dry_run=dry_run,
+            )
+            if not proxy_result.get("success"):
+                return _err(
+                    proxy_result.get("error") or "Failed to create RunPod analysis proxy.",
+                    code="RUNPOD_PROXY_FAILED",
+                    category="runpod",
+                )
+            stage_file_path = str(proxy_result["proxy_path"])
+            analysis_proxy = proxy_result
         try:
             staged = stage_file_to_runpod_network_volume(
-                file_path=clip_context["file_path"],
+                file_path=stage_file_path,
                 project_name=str(clip_context.get("project_name") or project_name or "Project"),
                 media_id=str(clip_context.get("media_id") or ""),
                 network_volume_id=p.get("runpod_network_volume_id") or p.get("runpodNetworkVolumeId"),
                 data_center_id=p.get("runpod_network_volume_datacenter_id") or p.get("runpodNetworkVolumeDatacenterId"),
                 endpoint_url=p.get("runpod_network_volume_endpoint_url") or p.get("runpodNetworkVolumeEndpointUrl"),
                 remote_prefix=p.get("runpod_volume_remote_prefix") or p.get("runpodVolumeRemotePrefix"),
-                dry_run=_media_analysis_bool(p.get("dry_run", p.get("dryRun")), False),
+                dry_run=dry_run,
                 api_key_env=str(p.get("runpod_api_key_env", p.get("runpodApiKeyEnv", DEFAULT_RUNPOD_API_KEY_ENV)) or DEFAULT_RUNPOD_API_KEY_ENV),
                 timeout=float(p.get("runpod_timeout", p.get("runpodTimeout", 30.0)) or 30.0),
             )
@@ -16129,7 +16439,13 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
             "analysis_backend": "runpod",
             "media_id": clip_context["media_id"],
             "clip_name": clip_context["clip_name"],
-            "file_path": clip_context["file_path"],
+            "source_file_path": clip_context["file_path"],
+            "staged_file_path": stage_file_path,
+            "staged_original_source": (
+                os.path.abspath(os.path.expanduser(stage_file_path))
+                == os.path.abspath(os.path.expanduser(str(clip_context["file_path"])))
+            ),
+            "analysis_proxy": _runpod_analysis_proxy_preview(analysis_proxy),
             "staging": _runpod_staging_preview(staged),
         }
     if action == "runpod_visual_status":
@@ -16317,6 +16633,17 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
             limit=int(p.get("limit", 10) or 10),
             auto_build=_media_analysis_bool(p.get("auto_build", p.get("autoBuild")), True),
         )
+    if action == "preflight_ai_cut":
+        raw_ids = p.get("clip_ids") or p.get("clipIds") or p.get("ids") or p.get("clip_id") or p.get("clipId")
+        if isinstance(raw_ids, str):
+            clip_ids = [item.strip() for item in raw_ids.split(",") if item.strip()]
+        elif isinstance(raw_ids, list):
+            clip_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+        else:
+            clip_ids = []
+        if not clip_ids:
+            return _err("preflight_ai_cut requires clip_ids")
+        return preflight_ai_cut(clip_ids)
     if action == "plan_ai_cut":
         raw_ids = p.get("clip_ids") or p.get("clipIds") or p.get("ids") or p.get("clip_id") or p.get("clipId")
         if isinstance(raw_ids, str):
@@ -16331,16 +16658,38 @@ async def media_analysis(action: str, params: Optional[Dict[str, Any]] = None, c
             clip_ids,
             goal=str(p.get("goal") or "short social cut"),
             style=str(p.get("style") or "clean punchy talking-head"),
+            target_duration=str(p.get("target_duration", p.get("targetDuration", "")) or ""),
+            undercut_bias=_media_analysis_bool(p.get("undercut_bias", p.get("undercutBias")), True),
+            content_type=str(p.get("content_type", p.get("contentType", "auto")) or "auto"),
+            cut_intent=str(p.get("cut_intent", p.get("cutIntent", "auto")) or "auto"),
+            timeline_mode=str(p.get("timeline_mode", p.get("timelineMode", "raw_dump")) or "raw_dump"),
+            takes_already_scrubbed=_media_analysis_bool(
+                p.get("takes_already_scrubbed", p.get("takesAlreadyScrubbed")),
+                False,
+            ),
+            reorder_allowed=_media_analysis_bool(p.get("reorder_allowed", p.get("reorderAllowed")), True),
             max_ranges=int(p.get("max_ranges", p.get("maxRanges", 12)) or 12),
             max_punch_ins=int(p.get("max_punch_ins", p.get("maxPunchIns", 16)) or 16),
             max_cutaways=int(p.get("max_cutaways", p.get("maxCutaways", 12)) or 12),
             persist=_media_analysis_bool(p.get("persist"), True),
+        )
+    if action == "validate_ai_cut_plan":
+        return validate_ai_cut_plan(
+            plan_id=p.get("plan_id") or p.get("planId"),
+            plan=p.get("plan") if isinstance(p.get("plan"), dict) else None,
+            project_name=p.get("project_name") or p.get("projectName"),
         )
     if action == "apply_ai_cut_plan":
         return apply_ai_cut_plan(
             plan_id=p.get("plan_id") or p.get("planId"),
             plan=p.get("plan") if isinstance(p.get("plan"), dict) else None,
             project_name=p.get("project_name") or p.get("projectName"),
+            timeline_name=p.get("timeline_name") or p.get("timelineName"),
+            if_exists=str(p.get("if_exists", p.get("ifExists", "version")) or "version"),
+            order_by=str(p.get("order_by", p.get("orderBy", "auto")) or "auto"),
+            min_score=float(p.get("min_score", p.get("minScore", 0.0)) or 0.0),
+            max_ranges=int(p.get("max_ranges", p.get("maxRanges", 0)) or 0) or None,
+            dry_run=_media_analysis_bool(p.get("dry_run", p.get("dryRun")), False),
         )
     if action == "verify_ai_cut_plan":
         return verify_ai_cut_plan(
@@ -20580,6 +20929,625 @@ def _fusion_boundary_report(comp, p: Dict[str, Any]):
     }
 
 
+def _fusion_tool_input(tool, input_name: Any):
+    name = str(input_name or "")
+    try:
+        inp = tool[name]
+        if inp:
+            return inp
+    except Exception:
+        pass
+    try:
+        inputs = tool.GetInputList() or {}
+    except Exception:
+        inputs = {}
+    for idx in inputs:
+        inp = inputs[idx]
+        try:
+            attrs = inp.GetAttrs() or {}
+        except Exception:
+            attrs = {}
+        if name in {
+            str(attrs.get("INPS_ID") or ""),
+            str(attrs.get("INPS_Name") or ""),
+            str(attrs.get("LINKS_Name") or ""),
+        }:
+            return inp
+    return None
+
+
+def _fusion_input_attrs(inp) -> Dict[str, Any]:
+    try:
+        attrs = inp.GetAttrs()
+        return attrs if isinstance(attrs, dict) else {}
+    except Exception:
+        return {}
+
+
+def _fusion_input_data_type(inp) -> str:
+    attrs = _fusion_input_attrs(inp)
+    return str(attrs.get("INPS_DataType") or attrs.get("LINKID_DataType") or attrs.get("IC_Type") or "").lower()
+
+
+def _fusion_point_value(value: Any) -> Optional[Dict[str, float]]:
+    if isinstance(value, dict):
+        x = value.get("x", value.get("X", value.get(1, value.get("1"))))
+        y = value.get("y", value.get("Y", value.get(2, value.get("2"))))
+    elif isinstance(value, (list, tuple)) and len(value) >= 2:
+        x, y = value[0], value[1]
+    else:
+        return None
+    try:
+        return {1: float(x), 2: float(y)}
+    except Exception:
+        return None
+
+
+def _fusion_keyframe_times(inp) -> List[Any]:
+    out: List[Any] = []
+    try:
+        kfs = inp.GetKeyFrames()
+    except Exception:
+        kfs = None
+    if isinstance(kfs, dict):
+        keys = list(kfs.keys())
+        values = list(kfs.values())
+        parsed_keys = [_motion_parse_float(key, None) for key in keys]
+        parsed_values = [_motion_parse_float(value, None) for value in values]
+        numeric_keys = [value for value in parsed_keys if value is not None]
+        numeric_values = [value for value in parsed_values if value is not None]
+        if (
+            len(numeric_values) == len(values)
+            and len(numeric_values) > 0
+            and len(numeric_keys) == len(keys)
+            and sorted(numeric_keys) == list(range(1, len(keys) + 1))
+        ):
+            out.extend(values)
+        else:
+            out.extend(keys)
+    elif kfs:
+        try:
+            out.extend(list(kfs))
+        except Exception:
+            pass
+    return out
+
+
+def _fusion_has_keyframe_at(inp, time_value: Any) -> bool:
+    target = _motion_parse_float(time_value, None)
+    for key in _fusion_keyframe_times(inp):
+        if _motion_parse_float(key, None) == target:
+            return True
+    return False
+
+
+def _fusion_read_keyframes(inp) -> List[Dict[str, Any]]:
+    keyframes = []
+    try:
+        kfs = inp.GetKeyFrames()
+    except Exception:
+        kfs = None
+    for t in _fusion_keyframe_times(inp):
+        try:
+            value = inp[t]
+        except Exception:
+            try:
+                value = inp.GetValue(t)
+            except Exception:
+                if isinstance(kfs, dict) and t in kfs:
+                    value = kfs[t]
+                else:
+                    value = None
+        keyframes.append({"time": t, "value": _ser(value)})
+    return keyframes
+
+
+def _fusion_attr(obj: Any, name: str) -> Any:
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return None
+
+
+def _fusion_tool_reg_id(obj: Any) -> str:
+    try:
+        attrs = obj.GetAttrs() or {}
+    except Exception:
+        attrs = {}
+    return str(attrs.get("TOOLS_RegID") or attrs.get("TOOLB_RegID") or "").lower()
+
+
+def _fusion_connected_modifier(inp) -> Any:
+    try:
+        output = inp.GetConnectedOutput()
+    except Exception:
+        output = None
+    if not output:
+        return None
+    try:
+        return output.GetTool()
+    except Exception:
+            return None
+
+
+def _fusion_path_displacement_input(path_obj: Any) -> Any:
+    if path_obj is None:
+        return None
+    return (
+        _fusion_attr(path_obj, "Displacement")
+        or _fusion_tool_input(path_obj, "Displacement")
+        or _fusion_tool_input(path_obj, "DisplacementControl")
+    )
+
+
+def _fusion_comp_path(comp) -> Any:
+    if not comp:
+        return None
+    try:
+        return comp.Path({})
+    except Exception:
+        try:
+            return comp.Path()
+        except Exception:
+            return None
+
+
+def _fusion_path_displacement(path_obj: Any) -> Any:
+    displacement = _fusion_path_displacement_input(path_obj)
+    connected = _fusion_connected_modifier(displacement) if displacement is not None else None
+    return connected or displacement
+
+
+def _fusion_xy_path_splines(path_obj: Any) -> Tuple[Any, Any]:
+    if path_obj is None or _fusion_tool_reg_id(path_obj) != "xypath":
+        return None, None
+    x_input = _fusion_tool_input(path_obj, "X")
+    y_input = _fusion_tool_input(path_obj, "Y")
+    return _fusion_connected_modifier(x_input) or x_input, _fusion_connected_modifier(y_input) or y_input
+
+
+def _fusion_point_modifier_splines(path_obj: Any) -> List[Any]:
+    if path_obj is None:
+        return []
+    if _fusion_tool_reg_id(path_obj) == "xypath":
+        return [spline for spline in _fusion_xy_path_splines(path_obj) if spline is not None]
+    displacement = _fusion_path_displacement(path_obj)
+    return [displacement] if displacement is not None else []
+
+
+def _fusion_is_path_object(obj: Any) -> bool:
+    if obj is None:
+        return False
+    if _fusion_path_displacement(obj):
+        return True
+    try:
+        attrs = obj.GetAttrs() or {}
+    except Exception:
+        attrs = {}
+    reg_id = str(attrs.get("TOOLS_RegID") or attrs.get("TOOLB_RegID") or "").lower()
+    name = str(attrs.get("TOOLS_Name") or attrs.get("LINKS_Name") or "").lower()
+    return reg_id in {"path", "xypath"} or "path" in reg_id or name.endswith("path")
+
+
+def _fusion_existing_path(tool, input_name: str, inp) -> Tuple[Any, Any]:
+    refreshed = _fusion_tool_input(tool, input_name) or inp
+    connected = _fusion_connected_modifier(refreshed)
+    if _fusion_is_path_object(connected):
+        return refreshed, connected
+    if _fusion_is_path_object(refreshed):
+        return refreshed, refreshed
+    return refreshed, None
+
+
+def _fusion_attach_point_modifier(comp, tool, input_name: str, inp, methods_tried: List[str], preferred: str = "XYPath") -> Tuple[Any, Any, bool]:
+    refreshed, existing = _fusion_existing_path(tool, input_name, inp)
+    if existing is not None:
+        existing_type = _fusion_tool_reg_id(existing)
+        if existing_type == str(preferred or "").lower():
+            methods_tried.append(f"reused existing {preferred}")
+            return refreshed, existing, False
+        if str(preferred or "").lower() == "xypath" and existing_type == "path":
+            try:
+                existing.Delete()
+                methods_tried.append("deleted existing Path before XYPath")
+            except Exception as exc:
+                methods_tried.append(f"delete existing Path error: {exc}")
+                return refreshed, existing, False
+            refreshed = _fusion_tool_input(tool, input_name) or refreshed
+        else:
+            methods_tried.append(f"reused existing {existing_type or 'Path'}")
+            return refreshed, existing, False
+
+    try:
+        added = bool(tool.AddModifier(input_name, preferred))
+        methods_tried.append(f"AddModifier({preferred})={added}")
+    except Exception as exc:
+        methods_tried.append(f"AddModifier({preferred}) error: {exc}")
+
+    refreshed, existing = _fusion_existing_path(tool, input_name, refreshed)
+    if existing is not None:
+        methods_tried.append(f"connected {_fusion_tool_reg_id(existing) or preferred} modifier found")
+        return refreshed, existing, True
+
+    if preferred != "Path":
+        try:
+            added = bool(tool.AddModifier(input_name, "Path"))
+            methods_tried.append(f"AddModifier(Path)={added}")
+        except Exception as exc:
+            methods_tried.append(f"AddModifier(Path) error: {exc}")
+
+        refreshed, existing = _fusion_existing_path(tool, input_name, refreshed)
+        if existing is not None:
+            methods_tried.append("connected Path modifier found")
+            return refreshed, existing, True
+
+    # Fallback for hosts where AddModifier succeeds but the Python bridge does
+    # not expose the attached modifier through GetConnectedOutput.
+    direct_path = _fusion_comp_path(comp)
+    if direct_path is not None:
+        try:
+            setattr(tool, input_name, direct_path)
+            methods_tried.append("setattr(tool,input,comp.Path)")
+        except Exception as exc:
+            methods_tried.append(f"setattr(tool,input,comp.Path) error: {exc}")
+        try:
+            tool.SetInput(input_name, direct_path)
+            methods_tried.append("SetInput(comp.Path)")
+        except Exception as exc:
+            methods_tried.append(f"SetInput(comp.Path) error: {exc}")
+        refreshed, existing = _fusion_existing_path(tool, input_name, direct_path)
+        if existing is not None:
+            methods_tried.append("direct comp.Path attached")
+            return refreshed, existing, True
+        return refreshed or direct_path, direct_path, True
+    return refreshed, None, True
+
+
+def _fusion_attach_path(comp, tool, input_name: str, inp, methods_tried: List[str]) -> Tuple[Any, Any, bool]:
+    return _fusion_attach_point_modifier(comp, tool, input_name, inp, methods_tried, preferred="Path")
+
+
+def _fusion_set_indexed(obj: Any, time_value: Any, value: Any, label: str, methods_tried: List[str]) -> bool:
+    if obj is None:
+        return False
+    try:
+        obj[time_value] = value
+        methods_tried.append(f"{label}[time]=value")
+        return True
+    except Exception as exc:
+        methods_tried.append(f"{label}[time]=value error: {exc}")
+        return False
+
+
+def _fusion_delete_indexed(obj: Any, time_value: Any, label: str, methods_tried: Optional[List[str]] = None) -> bool:
+    if obj is None:
+        return False
+    methods = methods_tried if methods_tried is not None else []
+    for method_name in ("DeleteKeyFrames", "RemoveKeyFrame", "DeleteKeyFrame"):
+        try:
+            method = getattr(obj, method_name)
+        except Exception:
+            method = None
+        if not callable(method):
+            continue
+        try:
+            method(time_value)
+            methods.append(f"{label}.{method_name}(time)")
+            return True
+        except Exception as exc:
+            methods.append(f"{label}.{method_name}(time) error: {exc}")
+    return False
+
+
+def _fusion_spline_payload_value(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        for key in (1, "1", "Value", "value"):
+            if key in payload:
+                return payload[key]
+    return payload
+
+
+def _fusion_path_point_times(path_obj: Any) -> List[Any]:
+    if path_obj is None:
+        return []
+    try:
+        kfs = path_obj.GetKeyFrames()
+    except Exception:
+        kfs = None
+    if isinstance(kfs, dict):
+        keys = list(kfs.keys())
+        values = list(kfs.values())
+        parsed_keys = [_motion_parse_float(key, None) for key in keys]
+        parsed_values = [_motion_parse_float(value, None) for value in values]
+        numeric_keys = [value for value in parsed_keys if value is not None]
+        numeric_values = [value for value in parsed_values if value is not None]
+        if (
+            len(numeric_values) == len(values)
+            and len(numeric_values) > 0
+            and len(numeric_keys) == len(keys)
+            and sorted(numeric_keys) == list(range(1, len(keys) + 1))
+        ):
+            return values
+        return [key for key, parsed in zip(keys, parsed_keys) if parsed is not None]
+    if kfs:
+        try:
+            return list(kfs)
+        except Exception:
+            return []
+    return []
+
+
+def _fusion_clean_auto_xy_hold_keys(path_obj: Any, authored_times: List[Any], methods_tried: List[str]) -> None:
+    if _fusion_tool_reg_id(path_obj) != "xypath":
+        return
+    authored = {_motion_parse_float(time_value, None) for time_value in authored_times}
+    authored = {time_value for time_value in authored if time_value is not None}
+    if not authored:
+        return
+    max_authored = max(authored)
+    for spline in _fusion_point_modifier_splines(path_obj):
+        try:
+            kfs = spline.GetKeyFrames() or {}
+        except Exception:
+            kfs = {}
+        if not isinstance(kfs, dict):
+            continue
+        for key in list(kfs.keys()):
+            parsed = _motion_parse_float(key, None)
+            if parsed is None or parsed in authored or parsed <= max_authored:
+                continue
+            _fusion_delete_indexed(spline, key, "XYPathAutoHold", methods_tried)
+
+
+def _fusion_point_landed(obj: Any, time_value: Any, point: Dict[str, float]) -> bool:
+    if obj is None:
+        return False
+    candidates = []
+    try:
+        candidates.append(obj[time_value])
+    except Exception:
+        pass
+    try:
+        candidates.append(obj.GetValue(time_value))
+    except Exception:
+        pass
+    try:
+        kfs = obj.GetKeyFrames()
+        if isinstance(kfs, dict) and time_value in kfs:
+            candidates.append(kfs[time_value])
+    except Exception:
+        pass
+    for candidate in candidates:
+        parsed = _fusion_point_value(candidate)
+        if not parsed:
+            continue
+        if abs(float(parsed[1]) - float(point[1])) < 0.0001 and abs(float(parsed[2]) - float(point[2])) < 0.0001:
+            return True
+    return False
+
+
+def _fusion_set_displacement(path_obj: Any, time_value: Any, methods_tried: List[str]) -> bool:
+    displacement = _fusion_path_displacement(path_obj)
+    if not displacement:
+        methods_tried.append("Displacement input not found")
+        return False
+    times = set()
+    for key in _fusion_path_point_times(path_obj) or _fusion_keyframe_times(displacement):
+        parsed = _motion_parse_float(key, None)
+        if parsed is not None:
+            times.add(parsed)
+    parsed_time = _motion_parse_float(time_value, None)
+    if parsed_time is not None:
+        times.add(parsed_time)
+    if not times:
+        return False
+    ordered = sorted(times)
+    if len(ordered) == 1:
+        _fusion_set_indexed(displacement, time_value, 0, "Displacement", methods_tried)
+        return _fusion_has_keyframe_at(displacement, time_value)
+    ok = False
+    for index, key_time in enumerate(ordered):
+        progress = index / float(len(ordered) - 1)
+        # Preserve the original frame key type when possible for the frame being
+        # authored; float keys are accepted by Fusion but integer-looking keys
+        # produce cleaner readback.
+        out_time = int(key_time) if float(key_time).is_integer() else key_time
+        _fusion_set_indexed(displacement, out_time, progress, "Displacement", methods_tried)
+        ok = _fusion_has_keyframe_at(displacement, out_time) or ok
+    return ok
+
+
+def _fusion_path_has_motion(path_obj: Any, inp: Any, time_value: Any) -> bool:
+    if inp is not None and _fusion_has_keyframe_at(inp, time_value):
+        return True
+    if path_obj is not None and _fusion_has_keyframe_at(path_obj, time_value):
+        return True
+    return any(_fusion_has_keyframe_at(spline, time_value) for spline in _fusion_point_modifier_splines(path_obj))
+
+
+def _fusion_read_point_keyframes(tool, input_name: str, inp) -> List[Dict[str, Any]]:
+    _refreshed, path_obj = _fusion_existing_path(tool, input_name, inp)
+    if _fusion_tool_reg_id(path_obj) == "xypath":
+        x_spline, y_spline = _fusion_xy_path_splines(path_obj)
+        keys = set()
+        for spline in (x_spline, y_spline):
+            if spline is None:
+                continue
+            for key in _fusion_keyframe_times(spline):
+                parsed = _motion_parse_float(key, None)
+                if parsed is not None and parsed > -999999999:
+                    keys.add(key)
+        rows: List[Dict[str, Any]] = []
+        for t in sorted(keys, key=lambda item: _motion_parse_float(item, 0.0) or 0.0):
+            try:
+                value = tool.GetInput(input_name, t)
+            except Exception:
+                try:
+                    value = inp[t]
+                except Exception:
+                    value = None
+            rows.append({"time": t, "value": _ser(value), "source": "XYPath.XY.BezierSpline"})
+        return rows
+
+    displacement = _fusion_path_displacement(path_obj)
+    if not displacement:
+        return _fusion_read_keyframes(inp)
+    rows: List[Dict[str, Any]] = []
+    try:
+        kfs = displacement.GetKeyFrames()
+    except Exception:
+        kfs = None
+    if isinstance(kfs, dict):
+        keys = list(kfs.keys())
+    elif kfs:
+        try:
+            keys = list(kfs)
+        except Exception:
+            keys = []
+    else:
+        keys = []
+    for t in sorted(keys, key=lambda item: _motion_parse_float(item, 0.0) or 0.0):
+        try:
+            value = tool.GetInput(input_name, t)
+        except Exception:
+            try:
+                value = inp[t]
+            except Exception:
+                value = None
+        rows.append(
+            {
+                "time": t,
+                "value": _ser(value),
+                "displacement": _ser(_fusion_spline_payload_value(kfs[t])) if isinstance(kfs, dict) and t in kfs else None,
+                "source": "Path.Displacement.BezierSpline" if _fusion_tool_reg_id(displacement) == "bezierspline" else "Path.Displacement",
+            }
+        )
+    return rows
+
+
+def _fusion_delete_keyframe_from_input(tool, input_name: str, inp, time_value: Any) -> Dict[str, Any]:
+    data_type = _fusion_input_data_type(inp)
+    methods_tried: List[str] = []
+    is_point = _fusion_current_point_value(tool, input_name) is not None or _fusion_existing_path(tool, input_name, inp)[1] is not None
+    if is_point:
+        refreshed, path_obj = _fusion_existing_path(tool, input_name, inp)
+        deleted = False
+        for spline in _fusion_point_modifier_splines(path_obj):
+            deleted = _fusion_delete_indexed(spline, time_value, "PointSpline", methods_tried) or deleted
+        deleted = _fusion_delete_indexed(path_obj, time_value, "Path", methods_tried) or deleted
+        deleted = _fusion_delete_indexed(refreshed, time_value, "input", methods_tried) or deleted
+        still_present = (
+            any(_fusion_has_keyframe_at(spline, time_value) for spline in _fusion_point_modifier_splines(path_obj))
+            or _fusion_has_keyframe_at(path_obj, time_value)
+            or _fusion_has_keyframe_at(refreshed, time_value)
+        )
+        if still_present:
+            return _err(
+                f"Fusion keyframe at {time_value} still exists for {input_name}",
+                code="FUSION_KEYFRAME_DELETE_FAILED",
+                category="resolve_api_failed",
+                details={"methods_tried": methods_tried, "input_type": data_type or "Point"},
+            )
+        return _ok(input_type=data_type or "Point", methods_tried=methods_tried, deleted=deleted)
+
+    deleted = _fusion_delete_indexed(inp, time_value, "input", methods_tried)
+    if _fusion_has_keyframe_at(inp, time_value):
+        return _err(
+            f"Fusion keyframe at {time_value} still exists for {input_name}",
+            code="FUSION_KEYFRAME_DELETE_FAILED",
+            category="resolve_api_failed",
+            details={"methods_tried": methods_tried, "input_type": data_type},
+        )
+    return _ok(input_type=data_type or None, methods_tried=methods_tried, deleted=deleted)
+
+
+def _fusion_current_point_value(tool, input_name: str) -> Optional[Dict[str, float]]:
+    try:
+        return _fusion_point_value(tool.GetInput(input_name))
+    except Exception:
+        return None
+
+
+def _fusion_add_keyframe_to_input(comp, tool, input_name: str, inp, time_value: Any, value: Any) -> Dict[str, Any]:
+    data_type = _fusion_input_data_type(inp)
+    point = _fusion_point_value(value)
+    is_point = point is not None and ("point" in data_type or "xy" in data_type or "position" in data_type or data_type == "")
+    methods_tried: List[str] = []
+    if is_point:
+        # Point inputs (Transform/Merge Center, etc.) need a Point modifier.
+        # XYPath gives Resolve separate X/Y BezierSpline channels, so movement
+        # appears as normal editable keyframes in the Keyframes/Splines panels.
+        prior_rows = _fusion_read_point_keyframes(tool, input_name, inp)
+        prior_points = []
+        for row in prior_rows:
+            prior_time = row.get("time")
+            parsed_time = _motion_parse_float(prior_time, None)
+            prior_point = _fusion_point_value(row.get("value"))
+            if parsed_time is None or prior_point is None:
+                continue
+            if _motion_parse_float(time_value, None) == parsed_time:
+                continue
+            prior_points.append((prior_time, prior_point))
+        inp, path_obj, attached_new_path = _fusion_attach_point_modifier(comp, tool, input_name, inp, methods_tried, preferred="XYPath")
+        for prior_time, prior_point in prior_points:
+            _fusion_set_indexed(inp, prior_time, prior_point, "input", methods_tried)
+        _fusion_set_indexed(inp, time_value, point, "input", methods_tried)
+        point_ok = _fusion_point_landed(inp, time_value, point) or _fusion_has_keyframe_at(inp, time_value)
+        if path_obj is not inp and _fusion_tool_reg_id(path_obj) != "xypath":
+            _fusion_set_indexed(path_obj, time_value, point, "Path", methods_tried)
+            point_ok = _fusion_point_landed(path_obj, time_value, point) or _fusion_has_keyframe_at(path_obj, time_value) or point_ok
+        try:
+            tool.SetInput(input_name, point, time_value)
+            methods_tried.append("SetInput(point,time)")
+        except Exception as exc:
+            methods_tried.append(f"SetInput(point,time) error: {exc}")
+        if _fusion_tool_reg_id(path_obj) == "xypath":
+            _fusion_clean_auto_xy_hold_keys(path_obj, [time_value, *[row[0] for row in prior_points]], methods_tried)
+            modifier_ok = any(_fusion_has_keyframe_at(spline, time_value) for spline in _fusion_point_modifier_splines(path_obj))
+        else:
+            modifier_ok = _fusion_set_displacement(path_obj, time_value, methods_tried)
+        if point_ok or modifier_ok or _fusion_path_has_motion(path_obj, inp, time_value):
+            return _ok(
+                input_type=data_type or "Point",
+                modifier=_fusion_tool_reg_id(path_obj) or "Path",
+                attached_new_path=bool(attached_new_path),
+                point_keyed=bool(point_ok),
+                displacement_keyed=bool(modifier_ok),
+                methods_tried=methods_tried,
+            )
+        return _err(
+            f"Fusion did not create a Point keyframe for {input_name} at {time_value}",
+            code="FUSION_POINT_KEYFRAME_FAILED",
+            category="resolve_api_failed",
+            details={"methods_tried": methods_tried, "input_type": data_type, "value": _ser(value)},
+        )
+
+    try:
+        inp[time_value] = value
+        methods_tried.append("input[time]=value")
+    except Exception as exc:
+        methods_tried.append(f"input[time]=value error: {exc}")
+        try:
+            tool.SetInput(input_name, value, time_value)
+            methods_tried.append("SetInput(value,time)")
+        except Exception as set_exc:
+            methods_tried.append(f"SetInput(value,time) error: {set_exc}")
+            return _err(
+                f"Failed to create keyframe for {input_name}: {set_exc}",
+                code="FUSION_KEYFRAME_FAILED",
+                category="resolve_api_failed",
+                details={"methods_tried": methods_tried, "input_type": data_type},
+            )
+    if not _fusion_has_keyframe_at(inp, time_value):
+        return _err(
+            f"Fusion did not create a keyframe for {input_name} at {time_value}",
+            code="FUSION_KEYFRAME_NOT_CREATED",
+            category="resolve_api_failed",
+            details={"methods_tried": methods_tried, "input_type": data_type},
+        )
+    return _ok(input_type=data_type or None, methods_tried=methods_tried)
+
+
 @mcp.tool()
 def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Fusion composition node graph operations.
@@ -20836,11 +21804,10 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
             return _err(f"Tool '{p['tool_name']}' not found")
         comp.Lock()
         try:
-            inp = tool[p["input_name"]]
+            inp = _fusion_tool_input(tool, p["input_name"])
             if not inp:
                 return _err(f"Input '{p['input_name']}' not found on tool '{p['tool_name']}'")
-            inp[p["time"]] = p["value"]
-            return _ok()
+            return _fusion_add_keyframe_to_input(comp, tool, p["input_name"], inp, p["time"], p["value"])
         finally:
             comp.Unlock()
 
@@ -20848,15 +21815,21 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
         tool = comp.FindTool(p["tool_name"])
         if not tool:
             return _err(f"Tool '{p['tool_name']}' not found")
-        inp = tool[p["input_name"]]
+        inp = _fusion_tool_input(tool, p["input_name"])
         if not inp:
             return _err(f"Input '{p['input_name']}' not found on tool '{p['tool_name']}'")
-        keyframes = []
-        kfs = inp.GetKeyFrames()
-        if kfs:
-            for t in kfs:
-                keyframes.append({"time": t, "value": _ser(kfs[t])})
-        return {"keyframes": keyframes}
+        input_type = _fusion_input_data_type(inp) or None
+        if _fusion_current_point_value(tool, p["input_name"]) is not None or _fusion_existing_path(tool, p["input_name"], inp)[1] is not None:
+            keyframes = _fusion_read_point_keyframes(tool, p["input_name"], inp)
+            return {
+                "keyframes": keyframes,
+                "input_type": input_type or "Point",
+                "source": keyframes[0].get("source") if keyframes else None,
+            }
+        return {
+            "keyframes": _fusion_read_keyframes(inp),
+            "input_type": input_type,
+        }
 
     elif action == "delete_keyframe":
         tool = comp.FindTool(p["tool_name"])
@@ -20864,11 +21837,10 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
             return _err(f"Tool '{p['tool_name']}' not found")
         comp.Lock()
         try:
-            inp = tool[p["input_name"]]
+            inp = _fusion_tool_input(tool, p["input_name"])
             if not inp:
                 return _err(f"Input '{p['input_name']}' not found on tool '{p['tool_name']}'")
-            inp.RemoveKeyFrame(p["time"])
-            return _ok()
+            return _fusion_delete_keyframe_from_input(tool, p["input_name"], inp, p["time"])
         finally:
             comp.Unlock()
 

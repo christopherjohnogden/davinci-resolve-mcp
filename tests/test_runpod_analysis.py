@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from src.utils.runpod_analysis import (
@@ -155,6 +157,27 @@ class RunPodAnalysisTests(unittest.TestCase):
         self.assertEqual(result["s3_uri"], "s3://vol123/resolve-mcp-staging/Project-A/media-01/Cam 01.mov")
         self.assertEqual(result["volume_path"], "/runpod-volume/resolve-mcp-staging/Project-A/media-01/Cam 01.mov")
         self.assertEqual(result["file_url"], "runpod-volume://resolve-mcp-staging/Project-A/media-01/Cam 01.mov")
+        self.assertEqual(result["file_path"], "/Volumes/Media/Project A/Cam 01.mov")
+        self.assertIsNone(result["size_bytes"])
+
+    def test_network_volume_stage_dry_run_reports_existing_file_size(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "proxy.mp4"
+            path.write_bytes(b"proxy-bytes")
+            env = {
+                "RUNPOD_NETWORK_VOLUME_ID": "vol123",
+                "RUNPOD_NETWORK_VOLUME_DATACENTER_ID": "US-NC-1",
+                "RUNPOD_NETWORK_VOLUME_ENDPOINT_URL": "https://s3api-us-nc-1.runpod.io",
+            }
+            with mock.patch.dict("os.environ", env, clear=True):
+                result = stage_file_to_runpod_network_volume(
+                    file_path=str(path),
+                    project_name="Project A",
+                    media_id="media:01",
+                    dry_run=True,
+                )
+        self.assertEqual(result["file_path"], str(path))
+        self.assertEqual(result["size_bytes"], len(b"proxy-bytes"))
 
     def test_staging_object_key_sanitizes_project_and_media_id(self):
         self.assertEqual(
